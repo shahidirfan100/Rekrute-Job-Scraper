@@ -59,7 +59,7 @@ function cleanText(htmlOrText) {
 }
 
 /**
- * Try to extract JobPosting from JSON-LD.
+ * JSON-LD JobPosting extraction.
  */
 function extractFromJsonLd($) {
     const scripts = $('script[type="application/ld+json"]');
@@ -110,7 +110,7 @@ function extractFromJsonLd($) {
                 };
             }
         } catch {
-            // continue on JSON errors
+            // ignore JSON errors
         }
     }
 
@@ -118,7 +118,7 @@ function extractFromJsonLd($) {
 }
 
 /**
- * Parse title + company + (maybe) location from headings.
+ * Parse title + company + possible location from headings.
  */
 function parseTitleCompanyLocation($) {
     const h1 = $('h1').first().text().trim();
@@ -139,13 +139,11 @@ function parseTitleCompanyLocation($) {
         company = $(companySel).first().text().trim() || null;
     }
 
-    // Microdata location
     if (!location) {
         const microLoc = $('[itemprop="jobLocation"] [itemprop="addressLocality"], [itemprop="addressLocality"]').first().text().trim();
         if (microLoc) location = microLoc;
     }
 
-    // FR/EN labels
     if (!location) {
         const locLabel = $('p:contains("Poste basé à"), p:contains("Localisation"), p:contains("Location")')
             .first()
@@ -160,17 +158,15 @@ function parseTitleCompanyLocation($) {
 }
 
 /**
- * Clean up a description HTML fragment:
- *  - remove scripts/styles/forms/nav/header/footer
- *  - drop sidebars, filters, pagination, footer, auth modal, etc.
- *  - keep the single densest content block as final.
+ * First sanitizer: remove scripts/styles/forms/nav/sidebar/footer etc.
+ * Then pick densest block.
  */
 function sanitizeDescriptionHtml(html) {
     if (!html) return null;
 
     const $ = cheerioLoad(`<div id="root">${html}</div>`);
 
-    // Remove obvious junk
+    // Remove noise
     $('#root script, #root style, #root link, #root noscript, #root form').remove();
     $('#root header, #root nav, #root footer').remove();
 
@@ -193,7 +189,7 @@ function sanitizeDescriptionHtml(html) {
         $(sel).remove();
     }
 
-    // Collapsing obvious layout wrappers if they only wrap a single child
+    // Flatten single-child wrappers
     let changed = true;
     while (changed) {
         changed = false;
@@ -202,7 +198,6 @@ function sanitizeDescriptionHtml(html) {
             const children = $el.children('div, section, article');
             const textLen = $el.text().replace(/\s+/g, ' ').trim().length;
             if (children.length === 1 && textLen === children.text().replace(/\s+/g, ' ').trim().length) {
-                // promote child
                 $('#root').append(children);
                 $el.remove();
                 changed = true;
@@ -210,7 +205,7 @@ function sanitizeDescriptionHtml(html) {
         });
     }
 
-    // Find densest content block inside root
+    // densest block in root
     let best = null;
     let bestLen = 0;
 
@@ -219,8 +214,6 @@ function sanitizeDescriptionHtml(html) {
         .each((_, el) => {
             const $el = $(el);
             const classId = (($el.attr('class') || '') + ' ' + ($el.attr('id') || '')).toLowerCase();
-
-            // Still skip any stray footer/nav/sidebar
             if (/footer|nav|menu|breadcrumb|sidebar|filter|pagination/.test(classId)) return;
 
             const text = $el.text().replace(/\s+/g, ' ').trim();
@@ -233,7 +226,9 @@ function sanitizeDescriptionHtml(html) {
 
     let finalHtml;
     if (best && bestLen > 80) {
-        finalHtml = cheerioLoad('<div></div>')('div').append(cheerioLoad(best).html() || '').html();
+        const $wrap = cheerioLoad('<div></div>');
+        $wrap('div').append(cheerioLoad(best).html() || '');
+        finalHtml = $wrap('div').html();
     } else {
         finalHtml = $('#root').html();
     }
@@ -243,10 +238,67 @@ function sanitizeDescriptionHtml(html) {
 }
 
 /**
- * Focused job description extraction:
- *   - FR sections: Poste, Profil recherché
- *   - EN sections: Job Description, Profile, Responsibilities
- *   - fallback: central job detail container, then sanitized.
+ * FINAL step for description_html:
+ *  - keep only "text-related" tags
+ *  - drop layout tags & attributes (only keep href on <a>).
+ */
+function simplifyHtmlContent(html) {
+    if (!html) return null;
+
+    const allowedTags = new Set([
+        'p', 'br',
+        'ul', 'ol', 'li',
+        'strong', 'b', 'em', 'i', 'u',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'a',
+    ]);
+
+    const $ = cheerioLoad(`<div id="root">${html}</div>`);
+
+    // unwrap all disallowed tags (div, section, span, etc.)
+    $('#root *').each((_, el) => {
+        const $el = $(el);
+        const tag = el.tagName ? el.tagName.toLowerCase() : '';
+
+        if (!allowedTags.has(tag)) {
+            const text = $el.text().trim();
+            const hasPChild = $el.find('p').length > 0;
+
+            if (text && !hasPChild && (tag === 'div' || tag === 'section' || tag === 'article')) {
+                const newHtml = `<p>${text}</p>`;
+                $el.replaceWith(newHtml);
+            } else {
+                $el.replaceWith($el.html() || '');
+            }
+        }
+    });
+
+    // Clean attributes & remove empty paragraphs/list items
+    $('#root *').each((_, el) => {
+        const $el = $(el);
+        const tag = el.tagName ? el.tagName.toLowerCase() : '';
+        const attrs = el.attribs || {};
+
+        Object.keys(attrs).forEach((attr) => {
+            $el.removeAttr(attr);
+        });
+
+        if (tag === 'a' && attrs.href) {
+            $el.attr('href', attrs.href);
+        }
+
+        if ((tag === 'p' || tag === 'li') && $el.text().replace(/\u00a0/g, ' ').trim().length === 0) {
+            $el.remove();
+        }
+    });
+
+    const result = $('#root').html() || '';
+    const trimmed = result.trim();
+    return trimmed || null;
+}
+
+/**
+ * Job description extraction (before simplification).
  */
 function getDescriptionHtml($) {
     let html = '';
@@ -273,7 +325,7 @@ function getDescriptionHtml($) {
     if (enPoste) html += enPoste;
     if (enProfil) html += enProfil;
 
-    // Rekrute-style job content containers (detail pages)
+    // detail page containers
     if (!html) {
         const jobSelectors = [
             '#job_desc',
@@ -286,6 +338,7 @@ function getDescriptionHtml($) {
             '.job-body',
             '.jobbody',
             '.jobdescription',
+            '[itemprop="description"]',
         ];
 
         for (const sel of jobSelectors) {
@@ -299,7 +352,7 @@ function getDescriptionHtml($) {
         }
     }
 
-    // As a last resort, central column (not whole site)
+    // fallback: central column
     if (!html) {
         const centerSelectors = [
             '.content-column',
@@ -334,7 +387,6 @@ function getDescriptionHtml($) {
 
     if (!html) return null;
 
-    // Normalize a little via jsdom, then aggressively sanitize
     try {
         const dom = new JSDOM(`<div id="root">${html}</div>`);
         const root = dom.window.document.getElementById('root');
@@ -346,7 +398,7 @@ function getDescriptionHtml($) {
 }
 
 /**
- * Extract posted date from page text.
+ * Date posted.
  */
 function getDatePosted($) {
     const frText = $('p:contains("Publiée"), span:contains("Publiée")').first().text();
@@ -410,7 +462,7 @@ function getSalary($, jsonLd, descriptionText) {
 }
 
 /**
- * Infer language from DOM + URL.
+ * Infer language.
  */
 function detectLanguage($, url) {
     const htmlLang =
@@ -438,38 +490,69 @@ function detectLanguage($, url) {
 }
 
 /**
- * Find job detail links on listing page.
+ * STRICT job-detail URL recognition + structural selectors.
+ * This is where Afrique listing previously got misclassified as a job.
  */
 function findJobLinks($, baseUrl) {
     const links = new Set();
 
-    $('a[href]').each((_, el) => {
+    // 1) Structural selectors (the standard Rekrute cards)
+    $('ul.job-list li.post-id a.titreJob, ul.job-list2 li.post-id a.titreJob, a.titreJob').each((_, el) => {
         const href = $(el).attr('href');
         if (!href) return;
         const abs = toAbs(href, baseUrl);
         if (!abs) return;
 
-        let url;
         try {
-            url = new URL(abs);
+            const url = new URL(abs);
+            if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
+
+            const path = url.pathname || '';
+
+            // Ignore clear listing paths (offres = plural / list)
+            if (/\/offres/i.test(path) || /offres\.html$/i.test(path)) return;
+
+            // Require a detail slug with numeric ID at the end, e.g.:
+            // /offre-emploi-some-title-177064.html
+            if (/\/offre-emploi[^/]*-\d+\.html$/i.test(path) || /\/job-offer[^/]*-\d+\.html$/i.test(path)) {
+                links.add(url.href);
+            }
         } catch {
-            return;
-        }
-
-        if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
-
-        const path = url.pathname || '';
-
-        if (/\/offre-emploi/i.test(path) || /\/job-offer/i.test(path) || /-emploi-/i.test(path)) {
-            links.add(url.href);
+            // ignore malformed URLs
         }
     });
+
+    // 2) Generic fallback over all anchors (extra safety)
+    if (links.size === 0) {
+        $('a[href]').each((_, el) => {
+            const href = $(el).attr('href');
+            if (!href) return;
+            const abs = toAbs(href, baseUrl);
+            if (!abs) return;
+
+            try {
+                const url = new URL(abs);
+                if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
+
+                const path = url.pathname || '';
+
+                // Skip listing pages
+                if (/\/offres/i.test(path) || /offres\.html$/i.test(path)) return;
+
+                if (/\/offre-emploi[^/]*-\d+\.html$/i.test(path) || /\/job-offer[^/]*-\d+\.html$/i.test(path)) {
+                    links.add(url.href);
+                }
+            } catch {
+                // ignore
+            }
+        });
+    }
 
     return [...links];
 }
 
 /**
- * Find next page URL from pagination.
+ * Next page from pagination.
  */
 function findNextPage($, baseUrl) {
     const relNextHref =
@@ -516,12 +599,11 @@ function buildStartUrl({ keyword, location, category, lang }) {
 }
 
 /**
- * Fallback: infer location from header text or URL slug.
+ * Fallback for location from header / URL.
  */
 function inferLocationFallback($, url, existingLocation) {
     if (existingLocation) return existingLocation;
 
-    // Try header/title text with pipe
     const headerText =
         $('.page-heading h1').first().text() ||
         $('h1').first().text() ||
@@ -533,14 +615,12 @@ function inferLocationFallback($, url, existingLocation) {
         if (m && m[1]) return m[1].trim();
     }
 
-    // Try any job title anchor (like listing teaser format) if present
     const teaser = $('a.titreJob').first().text();
     if (teaser) {
         const m = teaser.match(/\|\s*([^|]+?\(Morocco\)|[^|]+?\(Maroc\))/i);
         if (m && m[1]) return m[1].trim();
     }
 
-    // Slug: ...-casablanca-176253.html
     try {
         const path = new URL(url).pathname;
         const slugMatch = path.match(/-([a-zA-ZÀ-ÿ]+)-\d+\.html$/i);
@@ -799,16 +879,20 @@ async function main() {
                             parseTitleCompanyLocation($page);
 
                         const descriptionHtmlDom = getDescriptionHtml($page);
-                        // Prefer JSON-LD description, but sanitize both
+
                         const candidateHtml =
                             jsonLd?.descriptionHtml ||
                             jsonLd?.raw?.description ||
                             descriptionHtmlDom ||
                             null;
 
-                        const descriptionHtml = candidateHtml
+                        let descriptionHtml = candidateHtml
                             ? sanitizeDescriptionHtml(candidateHtml)
                             : null;
+
+                        // Simplify to text-related tags only
+                        descriptionHtml = simplifyHtmlContent(descriptionHtml);
+
                         const descriptionText = cleanText(descriptionHtml);
 
                         const datePostedLd = jsonLd?.datePosted || null;
