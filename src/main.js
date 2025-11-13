@@ -5,7 +5,6 @@ import { Actor, log } from 'apify';
 import {
     CheerioCrawler,
     Dataset,
-    sleep,
     RequestQueue,
 } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
@@ -476,7 +475,6 @@ function getDatePosted($) {
 /**
  * Extract extra meta from the header column:
  *   .col-md-10.col-sm-12.col-xs-12
- * (kept for salary / occasional hints)
  */
 function extractHeaderInfo($) {
     const header = $('.col-md-10.col-sm-12.col-xs-12').first();
@@ -549,7 +547,7 @@ function extractHeaderInfo($) {
 function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
     if (jsonLd?.employmentType) return jsonLd.employmentType;
 
-    // 2) <li> based extraction (most reliable on Rekrute)
+    // 2) <li> based extraction
     const li = $('li:contains("Type de contrat"), li:contains("Type of contract")').first();
     if (li.length) {
         const text = li
@@ -558,10 +556,9 @@ function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
             .replace(/\s+/g, ' ')
             .trim();
         if (text) {
-            // e.g. "Type of contract proposed : Permanent contract - Télétravail : Hybrid"
             const m =
                 text.match(/Type\s+de\s+contrat(?:\s+proposé)?\s*[:\-]\s*([^-\|]+)/i) ||
-                text.match(/Type\s+of\s+contract(?:\s+proposed)?\s*[:\-]\s*([^-\|]+)/i);
+                text.match(/Type\s+of\s+contract(?:\s+proposé)?\s*[:\-]\s*([^-\|]+)/i);
             if (m && m[1]) {
                 const parsed = m[1].trim();
                 if (parsed) return parsed;
@@ -569,10 +566,10 @@ function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
         }
     }
 
-    // 3) header meta as secondary
+    // 3) header meta
     if (headerMeta.employmentType) return headerMeta.employmentType;
 
-    // 4) heuristics from description/body text
+    // 4) heuristics
     const text = (descriptionText || $('body').text() || '').toLowerCase();
 
     if (/cdi\b/.test(text)) return 'CDI';
@@ -657,59 +654,41 @@ function detectLanguage($, url) {
 }
 
 /**
- * STRICT job-detail URL recognition + structural selectors.
+ * Strict job-detail URL recognition.
  */
+function isDetailUrl(url) {
+    try {
+        const u = new URL(url);
+        const path = u.pathname || '';
+        return (
+            /\/offre-emploi[^/]*-\d+\.html$/i.test(path) ||
+            /\/job-offer[^/]*-\d+\.html$/i.test(path)
+        );
+    } catch {
+        return false;
+    }
+}
+
 function findJobLinks($, baseUrl) {
     const links = new Set();
 
-    // 1) Structural selectors (the standard Rekrute cards)
+    // 1) Structural selectors
     $('ul.job-list li.post-id a.titreJob, ul.job-list2 li.post-id a.titreJob, a.titreJob').each((_, el) => {
         const href = $(el).attr('href');
         if (!href) return;
         const abs = toAbs(href, baseUrl);
         if (!abs) return;
-
-        try {
-            const url = new URL(abs);
-            if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
-
-            const path = url.pathname || '';
-
-            // Ignore clear listing paths (offres = plural / list)
-            if (/\/offres/i.test(path) || /offres\.html$/i.test(path)) return;
-
-            // Require a detail slug with numeric ID at the end
-            if (/\/offre-emploi[^/]*-\d+\.html$/i.test(path) || /\/job-offer[^/]*-\d+\.html$/i.test(path)) {
-                links.add(url.href);
-            }
-        } catch {
-            // ignore malformed URLs
-        }
+        if (isDetailUrl(abs)) links.add(abs);
     });
 
-    // 2) Generic fallback over all anchors
+    // 2) generic fallback if needed
     if (links.size === 0) {
         $('a[href]').each((_, el) => {
             const href = $(el).attr('href');
             if (!href) return;
             const abs = toAbs(href, baseUrl);
             if (!abs) return;
-
-            try {
-                const url = new URL(abs);
-                if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
-
-                const path = url.pathname || '';
-
-                // Skip listing pages
-                if (/\/offres/i.test(path) || /offres\.html$/i.test(path)) return;
-
-                if (/\/offre-emploi[^/]*-\d+\.html$/i.test(path) || /\/job-offer[^/]*-\d+\.html$/i.test(path)) {
-                    links.add(url.href);
-                }
-            } catch {
-                // ignore
-            }
+            if (isDetailUrl(abs)) links.add(abs);
         });
     }
 
@@ -717,29 +696,86 @@ function findJobLinks($, baseUrl) {
 }
 
 /**
- * Next page from pagination.
+ * Pagination: find next listing page.
+ *
+ * Rekrute patterns:
+ *   - <a href="...p=2..." class="next"></a>
+ *   - <select onchange="location = this.value;"> with option values = URLs
  */
 function findNextPage($, baseUrl) {
+    const tryHref = (sel) => {
+        const el = $(sel).first();
+        if (!el.length) return null;
+        const href = el.attr('href');
+        if (!href) return null;
+        return toAbs(href, baseUrl);
+    };
+
+    // 1) Explicit "next" link with class
+    let nextUrl = tryHref('.pagination a.next') || tryHref('a.next');
+    if (nextUrl) return nextUrl;
+
+    // 2) rel="next"
     const relNextHref =
         $('.pagination a[rel="next"]').attr('href') ||
         $('a[rel="next"]').attr('href');
-
     if (relNextHref) {
-        const abs = toAbs(relNextHref, baseUrl);
-        if (abs) return abs;
+        nextUrl = toAbs(relNextHref, baseUrl);
+        if (nextUrl) return nextUrl;
     }
 
-    const nextLink = $('a')
+    // 3) Text-based (Suivant / Next / › / »)
+    const nextTextHref = $('a')
         .filter((_, el) => {
             const txt = $(el).text().trim().toLowerCase();
-            return /(suivant|next|›|»|>)/.test(txt);
+            return /(suivant|next|›|»)/.test(txt);
         })
         .first()
         .attr('href');
+    if (nextTextHref) {
+        nextUrl = toAbs(nextTextHref, baseUrl);
+        if (nextUrl) return nextUrl;
+    }
 
-    if (nextLink) {
-        const abs = toAbs(nextLink, baseUrl);
-        if (abs) return abs;
+    // 4) SELECT-based pagination (onchange="location = this.value;")
+    const select = $('.pagination select').first();
+    if (select.length) {
+        const currentValue = select.val();
+        const options = select.find('option');
+        let foundCurrent = false;
+        let nextValue = null;
+
+        options.each((i, opt) => {
+            const val = $(opt).attr('value');
+            if (!foundCurrent) {
+                if (val === currentValue) {
+                    foundCurrent = true;
+                }
+                return;
+            }
+            // the very next option after current is our target
+            nextValue = val;
+            return false; // break
+        });
+
+        if (!nextValue && options.length >= 2) {
+            // fallback: figure out current index by "selected" attribute
+            let currentIndex = -1;
+            options.each((i, opt) => {
+                if ($(opt).is('[selected]')) {
+                    currentIndex = i;
+                    return false;
+                }
+            });
+            if (currentIndex > -1 && currentIndex + 1 < options.length) {
+                nextValue = $(options[currentIndex + 1]).attr('value');
+            }
+        }
+
+        if (nextValue) {
+            nextUrl = toAbs(nextValue, baseUrl);
+            if (nextUrl) return nextUrl;
+        }
     }
 
     return null;
@@ -807,323 +843,212 @@ function inferLocationFallback($, url, existingLocation, headerMeta = {}) {
 
 // ---------- Main actor ----------
 
-await Actor.init();
+Actor.main(async () => {
+    const input = (await Actor.getInput()) || {};
 
-async function main() {
-    try {
-        const input = (await Actor.getInput()) || {};
-        const {
-            keyword = '',
-            location = '',
-            category = '',
-            results_wanted: RESULTS_WANTED_RAW = 100,
-            max_pages: MAX_PAGES_RAW = 999,
-            collectDetails = true,
-            startUrl,
-            startUrls,
-            url,
-            proxyConfiguration,
-            lang = 'fr', // 'fr' | 'en' | 'both'
-            maxConcurrency: MAX_CONCURRENCY_RAW = 20,
-        } = input;
+    const {
+        startUrls = [],
+        keyword = '',
+        location = '',
+        category = '',
+        maxConcurrency = 20,
+        maxRequestsPerCrawl = 5000,
+    } = input;
 
-        const RESULTS_WANTED = toPositiveInt(RESULTS_WANTED_RAW, 100, { min: 1, max: 10000 });
-        const MAX_PAGES = toPositiveInt(MAX_PAGES_RAW, 999, { min: 1, max: 10000 });
-        const MAX_CONCURRENCY = toPositiveInt(MAX_CONCURRENCY_RAW, 20, { min: 1, max: 100 });
+    const requestQueue = await RequestQueue.open();
 
-        log.info('Input received', {
-            keyword,
-            location,
-            category,
-            RESULTS_WANTED,
-            MAX_PAGES,
-            collectDetails,
-            lang,
-            MAX_CONCURRENCY,
-        });
+    const normalizedStartUrls = [];
 
-        const initial = [];
-        if (Array.isArray(startUrls) && startUrls.length) {
-            for (const u of startUrls) {
-                if (u) initial.push(String(u));
+    // Support Apify UI startUrls: array of strings or { url }
+    if (Array.isArray(startUrls)) {
+        for (const s of startUrls) {
+            if (!s) continue;
+            if (typeof s === 'string') {
+                normalizedStartUrls.push(s);
+            } else if (typeof s === 'object' && s.url) {
+                normalizedStartUrls.push(s.url);
             }
         }
-        if (startUrl) initial.push(String(startUrl));
-        if (url) initial.push(String(url));
-
-        if (!initial.length) {
-            if (lang === 'both') {
-                initial.push(buildStartUrl({ keyword, location, category, lang: 'fr' }));
-                initial.push(buildStartUrl({ keyword, location, category, lang: 'en' }));
-            } else {
-                initial.push(buildStartUrl({ keyword, location, category, lang }));
-            }
-        }
-
-        log.info('Initial start URLs:', initial);
-
-        const proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration(proxyConfiguration)
-            : null;
-
-        const requestQueue = await RequestQueue.open();
-
-        for (const start of initial) {
-            await requestQueue.addRequest({
-                url: start,
-                userData: {
-                    label: 'LIST',
-                    pageNo: 1,
-                },
-            });
-        }
-
-        const visitedListUrls = new Set();
-        const seenJobUrls = new Set();
-
-        let saved = 0;
-        let queuedDetail = 0;
-        let listPages = 0;
-        let detailPages = 0;
-
-        const crawler = new CheerioCrawler({
-            requestQueue,
-            proxyConfiguration: proxyConf || undefined,
-            maxConcurrency: MAX_CONCURRENCY,
-            requestHandlerTimeoutSecs: 120,
-            navigationTimeoutSecs: 60,
-            maxRequestRetries: 3,
-            useSessionPool: true,
-            sessionPoolOptions: {
-                maxPoolSize: Math.max(50, MAX_CONCURRENCY * 2),
-                sessionOptions: { maxUsageCount: 50 },
-            },
-            preNavigationHooks: [
-                async (crawlingContext) => {
-                    const { request, session } = crawlingContext;
-
-                    const generated = headerGenerator.getHeaders({
-                        httpVersion: '2',
-                    });
-
-                    request.headers = {
-                        ...generated,
-                        ...request.headers,
-                    };
-
-                    await sleep(500 + Math.random() * 1500);
-
-                    log.debug('Requesting URL', {
-                        url: request.url,
-                        sessionId: session?.id,
-                    });
-                },
-            ],
-            failedRequestHandler: async ({ request, error, session }) => {
-                log.error(`Request failed ${request.url}: ${error?.message || error}`);
-                if (session) session.retire();
-            },
-            requestHandler: async (ctx) => {
-                const { request, $, body, session } = ctx;
-                const label = request.userData.label || 'LIST';
-                const pageNo = request.userData.pageNo || 1;
-
-                let $page = $;
-                if (!$page) {
-                    const html = typeof body === 'string' ? body : body?.toString('utf8');
-                    if (!html) {
-                        log.warning(`Empty body for ${label} ${request.url}`);
-                        return;
-                    }
-                    $page = cheerioLoad(html);
-                }
-
-                if (isBlocked($page)) {
-                    log.warning(`Potentially blocked page at ${request.url}`);
-                    if (session) session.retire();
-                    return;
-                }
-
-                if (label === 'LIST') {
-                    listPages++;
-                    const listUrl = request.loadedUrl || request.url;
-
-                    if (visitedListUrls.has(listUrl)) {
-                        log.debug(`Already visited LIST URL, skipping: ${listUrl}`);
-                        return;
-                    }
-                    visitedListUrls.add(listUrl);
-
-                    const remaining = RESULTS_WANTED - saved - queuedDetail;
-                    if (remaining <= 0) {
-                        log.info(`Reached RESULTS_WANTED, skipping new links on LIST.`);
-                        return;
-                    }
-
-                    const jobLinks = findJobLinks($page, listUrl);
-                    log.info(`LIST page ${pageNo} (${listUrl}) job links found: ${jobLinks.length}`);
-
-                    if (!jobLinks.length) {
-                        const snippet = $page('body').text().trim().slice(0, 200);
-                        log.warning(
-                            `No job links found on LIST page ${pageNo}: ${listUrl}. Body snippet: "${snippet}..."`
-                        );
-                    }
-
-                    const newJobLinks = [];
-                    for (const link of jobLinks) {
-                        if (seenJobUrls.has(link)) continue;
-                        seenJobUrls.add(link);
-                        newJobLinks.push(link);
-                    }
-
-                    if (collectDetails) {
-                        const allowed = newJobLinks.slice(0, remaining);
-                        for (const jobUrl of allowed) {
-                            await requestQueue.addRequest({
-                                url: jobUrl,
-                                userData: { label: 'DETAIL' },
-                            });
-                            queuedDetail++;
-                        }
-                        log.info(
-                            `Queued ${allowed.length} DETAIL requests (queuedDetail=${queuedDetail}, saved=${saved}).`
-                        );
-                    } else {
-                        const allowed = newJobLinks.slice(0, remaining);
-                        for (const jobUrl of allowed) {
-                            await Dataset.pushData({
-                                url: jobUrl,
-                                source: 'rekrute.com',
-                                discoveredOn: listUrl,
-                                pageNo,
-                                scrapedAt: new Date().toISOString(),
-                            });
-                            saved++;
-                        }
-                        log.info(`Saved ${allowed.length} URL-only items (saved=${saved}/${RESULTS_WANTED}).`);
-                    }
-
-                    if (pageNo < MAX_PAGES && saved < RESULTS_WANTED) {
-                        const nextPageUrl = findNextPage($page, listUrl);
-                        if (nextPageUrl && !visitedListUrls.has(nextPageUrl)) {
-                            log.info(`Enqueuing next LIST page: ${nextPageUrl}`);
-                            await requestQueue.addRequest({
-                                url: nextPageUrl,
-                                userData: { label: 'LIST', pageNo: pageNo + 1 },
-                            });
-                        } else if (nextPageUrl) {
-                            log.debug(`Next LIST page already seen/queued: ${nextPageUrl}`);
-                        } else {
-                            log.info(`No next LIST page found from ${listUrl}`);
-                        }
-                    } else if (pageNo >= MAX_PAGES) {
-                        log.info(`Reached MAX_PAGES=${MAX_PAGES}, stopping pagination.`);
-                    }
-                } else if (label === 'DETAIL') {
-                    detailPages++;
-
-                    if (!collectDetails) {
-                        log.debug(`DETAIL reached but collectDetails=false, skipping: ${request.url}`);
-                        return;
-                    }
-
-                    if (saved >= RESULTS_WANTED) {
-                        log.info(
-                            `Saved >= RESULTS_WANTED (${RESULTS_WANTED}), skipping DETAIL: ${request.url}`
-                        );
-                        return;
-                    }
-
-                    const detailUrl = request.loadedUrl || request.url;
-
-                    try {
-                        const pageLang = detectLanguage($page, detailUrl);
-
-                        const jsonLd = extractFromJsonLd($page);
-                        const headerMeta = extractHeaderInfo($page);
-
-                        const { title: titleHtml, company: companyHtml, location: locationHtml } =
-                            parseTitleCompanyLocation($page);
-
-                        const descriptionHtmlDom = getDescriptionHtml($page);
-
-                        const candidateHtml =
-                            jsonLd?.descriptionHtml ||
-                            jsonLd?.raw?.description ||
-                            descriptionHtmlDom ||
-                            null;
-
-                        let descriptionHtml = candidateHtml
-                            ? sanitizeDescriptionHtml(candidateHtml)
-                            : null;
-
-                        // Simplify to text-related tags only
-                        descriptionHtml = simplifyHtmlContent(descriptionHtml);
-
-                        const descriptionText = cleanText(descriptionHtml);
-
-                        const datePostedLd = jsonLd?.datePosted || null;
-                        const datePostedText = getDatePosted($page);
-                        const datePosted = datePostedLd || datePostedText || null;
-
-                        const finalTitle = jsonLd?.title || titleHtml || null;
-                        const finalCompany = jsonLd?.company || companyHtml || null;
-
-                        let finalLocation =
-                            jsonLd?.location ||
-                            locationHtml ||
-                            null;
-                        finalLocation = inferLocationFallback($page, detailUrl, finalLocation, headerMeta);
-
-                        const employmentType = getEmploymentType($page, jsonLd, descriptionText, headerMeta);
-                        const salary = getSalary($page, jsonLd, descriptionText, headerMeta);
-
-                        const record = {
-                            url: detailUrl,
-                            title: finalTitle,
-                            company: finalCompany,
-                            location: finalLocation || null,
-                            datePosted,
-                            employmentType: employmentType || null,
-                            validThrough: jsonLd?.validThrough || null,
-                            salary: salary || null,
-                            descriptionHtml: descriptionHtml || null,
-                            descriptionText: descriptionText || null,
-                            language: pageLang || null,
-                            source: 'rekrute.com',
-                            scrapedAt: new Date().toISOString(),
-                        };
-
-                        await Dataset.pushData(record);
-                        saved++;
-
-                        log.info(`Saved DETAIL ${saved}/${RESULTS_WANTED}: ${detailUrl}`);
-                    } catch (err) {
-                        log.error(`Failed to process DETAIL ${request.url}: ${err.message}`);
-                        if (session) session.retire();
-                    }
-                } else {
-                    log.warning(`Unknown label "${label}" for URL ${request.url}, skipping.`);
-                }
-            },
-        });
-
-        await crawler.run();
-
-        log.info('Crawl finished', {
-            saved,
-            RESULTS_WANTED,
-            listPages,
-            detailPages,
-            queuedDetail,
-        });
-    } finally {
-        await Actor.exit();
     }
-}
 
-main().catch((err) => {
-    console.error(err);
-    process.exit(1);
+    // Support single startUrl/url in input
+    if (input.startUrl) normalizedStartUrls.push(input.startUrl);
+    if (input.url) normalizedStartUrls.push(input.url);
+
+    // If none provided, build default English listing with filters
+    if (normalizedStartUrls.length === 0) {
+        const urlEn = buildStartUrl({ keyword, location, category, lang: 'en' });
+        normalizedStartUrls.push(urlEn);
+    }
+
+    // Enqueue initial requests with correct label (LIST or DETAIL)
+    for (const url of normalizedStartUrls) {
+        const label = isDetailUrl(url) ? 'DETAIL' : 'LIST';
+        await requestQueue.addRequest({
+            url,
+            userData: {
+                label,
+                initial: true,
+            },
+        });
+    }
+
+    const crawler = new CheerioCrawler({
+        requestQueue,
+        maxConcurrency: toPositiveInt(maxConcurrency, 20, { min: 1, max: 1000 }),
+        maxRequestsPerCrawl: toPositiveInt(maxRequestsPerCrawl, 5000, { min: 1, max: 100000 }),
+        useSessionPool: true,
+        sessionPoolOptions: {
+            maxPoolSize: 100,
+        },
+        additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
+        preNavigationHooks: [
+            async ({ request }) => {
+                const headers = headerGenerator.getHeaders({
+                    webBrowser: 'chrome',
+                    device: 'desktop',
+                    operatingSystem: 'windows',
+                    httpVersion: '2',
+                });
+
+                headers['Accept-Language'] =
+                    headers['Accept-Language'] ||
+                    'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7';
+                headers['Referer'] = headers['Referer'] || 'https://www.rekrute.com/';
+
+                request.headers = {
+                    ...request.headers,
+                    ...headers,
+                };
+            },
+        ],
+        requestHandlerTimeoutSecs: 90,
+        maxRequestRetries: 3,
+
+        requestHandler: async ({ request, $, response, session }) => {
+            const url = request.loadedUrl || request.url;
+
+            if (!$) {
+                throw new Error(`No HTML body loaded for ${url}`);
+            }
+
+            if (response && response.statusCode >= 400) {
+                log.warning(`Got status ${response.statusCode} for ${url}`);
+            }
+
+            if (isBlocked($)) {
+                log.warning(`Blocked or CAPTCHA at ${url}`);
+                if (session) session.markBad();
+                throw new Error('Blocked by target site');
+            }
+
+            const userLabel = request.userData.label || 'AUTO';
+            const weAreDetail = isDetailUrl(url);
+            const isDetail = userLabel === 'DETAIL' || (userLabel === 'AUTO' && weAreDetail);
+
+            if (!isDetail) {
+                // ---------- LISTING PAGE ----------
+                log.info(`Listing page: ${url}`);
+
+                const baseUrl = url;
+
+                // 1) enqueue job detail links
+                const jobLinks = findJobLinks($, baseUrl);
+                if (jobLinks.length === 0) {
+                    log.warning(`No job links found on listing: ${url}`);
+                } else {
+                    log.info(`Found ${jobLinks.length} job links on listing`);
+                }
+
+                for (const link of jobLinks) {
+                    await requestQueue.addRequest({
+                        url: link,
+                        userData: {
+                            label: 'DETAIL',
+                            sourceUrl: baseUrl,
+                        },
+                    });
+                }
+
+                // 2) pagination
+                const nextUrl = findNextPage($, baseUrl);
+                if (nextUrl) {
+                    log.info(`Enqueueing next listing page: ${nextUrl}`);
+                    await requestQueue.addRequest({
+                        url: nextUrl,
+                        userData: {
+                            label: 'LIST',
+                        },
+                    });
+                } else {
+                    log.info(`No next page found from ${url}`);
+                }
+
+                return;
+            }
+
+            // ---------- DETAIL PAGE ----------
+            log.info(`Detail page: ${url}`);
+
+            const jsonLd = extractFromJsonLd($);
+            const { title: titleParsed, company: companyParsed, location: headingLocation } =
+                parseTitleCompanyLocation($);
+            const headerMeta = extractHeaderInfo($);
+            const descriptionHtmlRaw = jsonLd?.descriptionHtml || getDescriptionHtml($);
+            const descriptionHtml = simplifyHtmlContent(descriptionHtmlRaw);
+            const descriptionText = cleanText(descriptionHtml);
+
+            const datePosted = jsonLd?.datePosted || getDatePosted($);
+
+            let locationFinal = jsonLd?.location || headingLocation || null;
+            locationFinal = inferLocationFallback($, url, locationFinal, headerMeta);
+
+            const employmentType = getEmploymentType(
+                $,
+                jsonLd,
+                descriptionText,
+                headerMeta,
+            );
+            const salary = getSalary(
+                $,
+                jsonLd,
+                descriptionText,
+                headerMeta,
+            );
+            const language = detectLanguage($, url);
+
+            const jobIdMatch = url.match(/-(\d+)\.html$/);
+            const jobId = jobIdMatch ? jobIdMatch[1] : null;
+
+            const result = {
+                url,
+                sourceUrl: request.userData.sourceUrl || null,
+                jobId,
+                title: jsonLd?.title || titleParsed || null,
+                company: jsonLd?.company || companyParsed || null,
+                datePosted,
+                descriptionHtml,
+                descriptionText,
+                employmentType,
+                salary,
+                location: locationFinal,
+                language,
+                rawJsonLd: jsonLd?.raw || null,
+                scrapedAt: new Date().toISOString(),
+            };
+
+            await Dataset.pushData(result);
+            log.info(`Saved job ${jobId || ''} from ${url}`);
+        },
+
+        failedRequestHandler: async ({ request }) => {
+            log.error(
+                `Request ${request.url} failed too many times (label=${request.userData.label})`,
+            );
+        },
+    });
+
+    log.info('Starting crawler...');
+    await crawler.run();
+    log.info('Crawler finished.');
 });
