@@ -1,5 +1,5 @@
 // Rekrute.com jobs scraper - production-ready CheerioCrawler implementation
-// Stack: Apify SDK + Crawlee + CheerioCrawler + header-generator + jsdom (optional fallback)
+// Stack: Apify SDK + Crawlee + CheerioCrawler + header-generator + jsdom
 
 import { Actor, log } from 'apify';
 import {
@@ -160,6 +160,12 @@ function parseTitleCompanyLocation($) {
         company = $(companySel).first().text().trim() || null;
     }
 
+    // Microdata / schema.org addressLocality
+    if (!location) {
+        const microLoc = $('[itemprop="jobLocation"] [itemprop="addressLocality"], [itemprop="addressLocality"]').first().text().trim();
+        if (microLoc) location = microLoc;
+    }
+
     // Fallback: location label in FR/EN
     if (!location) {
         const locLabel = $('p:contains("Poste basé à"), p:contains("Localisation"), p:contains("Location")')
@@ -175,6 +181,47 @@ function parseTitleCompanyLocation($) {
 }
 
 /**
+ * Pick main content container by heuristics (for description fallback).
+ */
+function findMainContentHtml($) {
+    const selectors = [
+        '#job_desc', '#job', '#job-info', '#jobInfo', '#jobDetail',
+        '.job-description', '.job__description', '.annonce', '.job', '.jobDetail',
+        'article.job', 'article'
+    ];
+
+    for (const sel of selectors) {
+        const el = $(sel).first();
+        if (el.length) {
+            const textLen = el.text().replace(/\s+/g, ' ').trim().length;
+            if (textLen > 200) {
+                return el.html() || null;
+            }
+        }
+    }
+
+    // Fallback: densest <div>/<section> in the page body
+    let bestHtml = null;
+    let bestLen = 0;
+
+    $('div, section').each((_, el) => {
+        const $el = $(el);
+        // Skip navigation/footer/header-ish elements by class/id
+        const id = ($el.attr('id') || '').toLowerCase();
+        const cls = ($el.attr('class') || '').toLowerCase();
+        if (/header|footer|nav|menu|breadcrumb|sidebar/.test(id + ' ' + cls)) return;
+
+        const textLen = $el.text().replace(/\s+/g, ' ').trim().length;
+        if (textLen > bestLen) {
+            bestLen = textLen;
+            bestHtml = $el.html() || null;
+        }
+    });
+
+    return bestLen > 100 ? bestHtml : null;
+}
+
+/**
  * Extract description HTML from FR and EN section headings,
  * with a broad fallback to main job description container.
  */
@@ -182,8 +229,8 @@ function getDescriptionHtml($) {
     let html = '';
 
     // FR sections
-    const posteFr = $('h2:contains("Poste :")').nextUntil('h2').html();
-    const profilFr = $('h2:contains("Profil recherché :")').nextUntil('h2').html();
+    const posteFr = $('h2:contains("Poste :"), h2:contains("Poste")').nextUntil('h2').html();
+    const profilFr = $('h2:contains("Profil recherché :"), h2:contains("Profil recherché")').nextUntil('h2').html();
 
     // EN sections (approximate)
     const posteEn = $('h2:contains("Job Description"), h2:contains("Position"), h2:contains("Role")')
@@ -200,12 +247,7 @@ function getDescriptionHtml($) {
 
     // Broad fallback: main job container (guessing common patterns)
     if (!html) {
-        const container = $(
-            '#job_desc, #job, #job-info, .job-description, .annonce, .job, .jobDetail'
-        ).first();
-        if (container.length) {
-            html = container.html() || '';
-        }
+        html = findMainContentHtml($) || '';
     }
 
     if (!html) return null;
@@ -221,22 +263,105 @@ function getDescriptionHtml($) {
 }
 
 /**
- * Extract posted date from textual hints in FR + EN.
+ * Extract posted date from textual hints in FR + EN, plus generic date regex.
  */
 function getDatePosted($) {
     // FR: "Publiée le ..."
-    const frText = $('p:contains("Publiée")').first().text();
+    const frText = $('p:contains("Publiée"), span:contains("Publiée")').first().text();
     if (frText) {
         const m = frText.match(/Publiée\s+(?:le\s+)?(.*)/i);
         if (m && m[1]) return m[1].trim();
     }
 
     // EN: "Published on ...", "Posted on ..."
-    const enText = $('p:contains("Published"), p:contains("Posted")').first().text();
+    const enText = $('p:contains("Published"), p:contains("Posted"), span:contains("Published"), span:contains("Posted")')
+        .first()
+        .text();
     if (enText) {
         const m = enText.match(/(?:Published|Posted)\s+(?:on\s+)?(.*)/i);
         if (m && m[1]) return m[1].trim();
     }
+
+    // Generic date pattern somewhere in body (dd/mm/yyyy or dd-mm-yyyy etc.)
+    const bodyText = $('body').text();
+    const dateMatch = bodyText.match(/(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/);
+    if (dateMatch && dateMatch[1]) {
+        return dateMatch[1];
+    }
+
+    return null;
+}
+
+/**
+ * Guess employment type from JSON-LD or body text.
+ */
+function getEmploymentType($, jsonLd, descriptionText) {
+    if (jsonLd?.employmentType) return jsonLd.employmentType;
+
+    const text = (descriptionText || $('body').text() || '').toLowerCase();
+
+    if (/cdi\b/.test(text)) return 'CDI';
+    if (/cdd\b/.test(text)) return 'CDD';
+    if (/full[-\s]?time|temps plein/.test(text)) return 'FULL_TIME';
+    if (/part[-\s]?time|temps partiel/.test(text)) return 'PART_TIME';
+    if (/stage|internship/.test(text)) return 'INTERNSHIP';
+    if (/freelance|indépendant|independent contractor/.test(text)) return 'CONTRACTOR';
+
+    return null;
+}
+
+/**
+ * Guess salary range from JSON-LD or body text.
+ */
+function getSalary($, jsonLd, descriptionText) {
+    if (jsonLd?.salary) return jsonLd.salary;
+
+    const text = (descriptionText || $('body').text() || '');
+
+    // Common currency markers: MAD, DH, DHS, €, EUR
+    const regexes = [
+        /(\d[\d\s\.]{2,})\s*(MAD|DH|DHS|€|EUR)/i,
+        /(salaire|rémunération)\s*[:\-]?\s*([^\n]+)/i,
+    ];
+
+    for (const re of regexes) {
+        const m = text.match(re);
+        if (m) {
+            // Prefer numeric + currency if present
+            if (m[1] && m[2]) return `${m[1].trim()} ${m[2].trim()}`;
+            if (m[2]) return m[2].trim();
+            if (m[1]) return m[1].trim();
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Infer language from DOM + URL.
+ */
+function detectLanguage($, url) {
+    const htmlLang =
+        $('html').attr('lang') ||
+        $('html').attr('xml:lang') ||
+        $('meta[http-equiv="content-language"]').attr('content') ||
+        '';
+
+    const langLower = htmlLang.toLowerCase();
+
+    if (langLower.startsWith('fr')) return 'fr';
+    if (langLower.startsWith('en')) return 'en';
+
+    if (/\/en\//i.test(url)) return 'en';
+    if (/rekrute\.com\/(fr|offres)/i.test(url)) return 'fr';
+
+    // Fallback: naive word-based detection
+    const bodyText = $('body').text().toLowerCase();
+    const frHits = (bodyText.match(/\boffre d'emploi|poste|profil recherché|contrat|mission\b/g) || []).length;
+    const enHits = (bodyText.match(/\bjob|position|requirements|responsibilities|full-time|part-time\b/g) || []).length;
+
+    if (frHits > enHits) return 'fr';
+    if (enHits > frHits) return 'en';
 
     return null;
 }
@@ -268,8 +393,6 @@ function findJobLinks($, baseUrl) {
         const path = url.pathname || '';
 
         // Heuristics for job offer URLs:
-        // - French often includes "offre-emploi"
-        // - English may keep same or use a similar slug
         if (
             /\/offre-emploi/i.test(path) ||
             /\/job-offer/i.test(path) ||
@@ -356,10 +479,12 @@ async function main() {
             url,
             proxyConfiguration,
             lang = 'fr', // 'fr' | 'en' | 'both'
+            maxConcurrency: MAX_CONCURRENCY_RAW = 20, // << configurable concurrency
         } = input;
 
         const RESULTS_WANTED = toPositiveInt(RESULTS_WANTED_RAW, 100, { min: 1, max: 10000 });
         const MAX_PAGES = toPositiveInt(MAX_PAGES_RAW, 999, { min: 1, max: 10000 });
+        const MAX_CONCURRENCY = toPositiveInt(MAX_CONCURRENCY_RAW, 20, { min: 1, max: 100 });
 
         log.info('Input received', {
             keyword,
@@ -369,6 +494,7 @@ async function main() {
             MAX_PAGES,
             collectDetails,
             lang,
+            MAX_CONCURRENCY,
         });
 
         // Build initial URLs
@@ -422,13 +548,13 @@ async function main() {
         const crawler = new CheerioCrawler({
             requestQueue,
             proxyConfiguration: proxyConf || undefined,
-            maxConcurrency: 5,
+            maxConcurrency: MAX_CONCURRENCY,
             requestHandlerTimeoutSecs: 120,
             navigationTimeoutSecs: 60,
             maxRequestRetries: 3,
             useSessionPool: true,
             sessionPoolOptions: {
-                maxPoolSize: 50,
+                maxPoolSize: Math.max(50, MAX_CONCURRENCY * 2),
                 sessionOptions: {
                     maxUsageCount: 50,
                 },
@@ -448,7 +574,7 @@ async function main() {
                     };
 
                     // Light randomized delay to look more human
-                    await sleep(1000 + Math.random() * 2000);
+                    await sleep(500 + Math.random() * 1500);
 
                     log.debug('Requesting URL', {
                         url: request.url,
@@ -605,20 +731,19 @@ async function main() {
                     const detailUrl = request.loadedUrl || request.url;
 
                     try {
-                        const pageLang =
-                            $page('html').attr('lang') ||
-                            $page('html').attr('xml:lang') ||
-                            null;
+                        const pageLang = detectLanguage($page, detailUrl);
 
                         const jsonLd = extractFromJsonLd($page);
                         const { title: titleHtml, company: companyHtml, location: locationHtml } =
                             parseTitleCompanyLocation($page);
                         const descriptionHtml = getDescriptionHtml($page);
 
+                        // Prefer JSON-LD description, then HTML container description
                         const descriptionText =
                             cleanText(jsonLd?.descriptionHtml) ||
                             cleanText(descriptionHtml);
 
+                        // Date posted: JSON-LD, then DOM/text heuristics
                         const datePostedLd = jsonLd?.datePosted || null;
                         const datePostedText = getDatePosted($page);
                         const datePosted = datePostedLd || datePostedText || null;
@@ -627,18 +752,21 @@ async function main() {
                         const finalCompany = jsonLd?.company || companyHtml || null;
                         const finalLocation = jsonLd?.location || locationHtml || null;
 
+                        const employmentType = getEmploymentType($page, jsonLd, descriptionText);
+                        const salary = getSalary($page, jsonLd, descriptionText);
+
                         const record = {
                             url: detailUrl,
                             title: finalTitle,
                             company: finalCompany,
                             location: finalLocation,
                             datePosted,
-                            employmentType: jsonLd?.employmentType || null,
+                            employmentType: employmentType || null,
                             validThrough: jsonLd?.validThrough || null,
-                            salary: jsonLd?.salary || null,
+                            salary: salary || null,
                             descriptionHtml: jsonLd?.descriptionHtml || descriptionHtml || null,
                             descriptionText: descriptionText || null,
-                            language: pageLang,
+                            language: pageLang || null,
                             source: 'rekrute.com',
                             scrapedAt: new Date().toISOString(),
                         };
