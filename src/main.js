@@ -20,6 +20,9 @@ const headerGenerator = new HeaderGenerator({
     locales: ['fr-FR', 'fr', 'en-US', 'en'],
 });
 
+// Counter to respect max items limit
+let scrapedCount = 0;
+
 function toPositiveInt(value, defaultValue, { min = 1, max = 100000 } = {}) {
     const n = Number(value);
     if (!Number.isFinite(n)) return defaultValue;
@@ -495,7 +498,7 @@ function extractHeaderInfo($) {
     // Employment type patterns (French & English)
     const typePatterns = [
         /Type\s+de\s+contrat(?:\s+proposé)?\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
-        /Type\s+of\s+contract(?:\s+proposed)?\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Type\s+of\s+contract(?:\s+proposé)?\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
         /Contrat\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
     ];
     for (const re of typePatterns) {
@@ -855,6 +858,22 @@ Actor.main(async () => {
         maxRequestsPerCrawl = 5000,
     } = input;
 
+    // Respect "max jobs" from various possible input fields
+    const rawLimit =
+        input.maxItems ??
+        input.maxJobs ??
+        input.maxResults ??
+        input.limit ??
+        0;
+    const maxItems = toPositiveInt(rawLimit, 0, { min: 0, max: 100000 }); // 0 = unlimited
+    if (maxItems > 0) {
+        log.info(`Max items requested: ${maxItems}`);
+    } else {
+        log.info('No max items limit set (will crawl all available jobs within other limits).');
+    }
+
+    scrapedCount = 0;
+
     const requestQueue = await RequestQueue.open();
 
     const normalizedStartUrls = [];
@@ -928,6 +947,12 @@ Actor.main(async () => {
         requestHandler: async ({ request, $, response, session }) => {
             const url = request.loadedUrl || request.url;
 
+            // If we already reached the limit, skip all further work
+            if (maxItems > 0 && scrapedCount >= maxItems) {
+                log.debug(`Max items reached, skipping request: ${url}`);
+                return;
+            }
+
             if (!$) {
                 throw new Error(`No HTML body loaded for ${url}`);
             }
@@ -950,6 +975,12 @@ Actor.main(async () => {
                 // ---------- LISTING PAGE ----------
                 log.info(`Listing page: ${url}`);
 
+                // If limit already hit, do nothing
+                if (maxItems > 0 && scrapedCount >= maxItems) {
+                    log.info(`Max items reached, not processing listing: ${url}`);
+                    return;
+                }
+
                 const baseUrl = url;
 
                 // 1) enqueue job detail links
@@ -960,7 +991,15 @@ Actor.main(async () => {
                     log.info(`Found ${jobLinks.length} job links on listing`);
                 }
 
+                // Respect remaining slots for jobs
+                let remaining = Infinity;
+                if (maxItems > 0) {
+                    remaining = Math.max(maxItems - scrapedCount, 0);
+                }
+
+                let addedCount = 0;
                 for (const link of jobLinks) {
+                    if (remaining <= 0) break;
                     await requestQueue.addRequest({
                         url: link,
                         userData: {
@@ -968,20 +1007,30 @@ Actor.main(async () => {
                             sourceUrl: baseUrl,
                         },
                     });
+                    remaining -= 1;
+                    addedCount += 1;
                 }
 
-                // 2) pagination
-                const nextUrl = findNextPage($, baseUrl);
-                if (nextUrl) {
-                    log.info(`Enqueueing next listing page: ${nextUrl}`);
-                    await requestQueue.addRequest({
-                        url: nextUrl,
-                        userData: {
-                            label: 'LIST',
-                        },
-                    });
+                if (addedCount > 0) {
+                    log.info(`Enqueued ${addedCount} job detail requests from listing ${url}`);
+                }
+
+                // Only follow pagination if we still have capacity
+                if (maxItems === 0 || scrapedCount < maxItems) {
+                    const nextUrl = findNextPage($, baseUrl);
+                    if (nextUrl) {
+                        log.info(`Enqueueing next listing page: ${nextUrl}`);
+                        await requestQueue.addRequest({
+                            url: nextUrl,
+                            userData: {
+                                label: 'LIST',
+                            },
+                        });
+                    } else {
+                        log.info(`No next page found from ${url}`);
+                    }
                 } else {
-                    log.info(`No next page found from ${url}`);
+                    log.info(`Max items reached, pagination not followed from ${url}`);
                 }
 
                 return;
@@ -989,6 +1038,12 @@ Actor.main(async () => {
 
             // ---------- DETAIL PAGE ----------
             log.info(`Detail page: ${url}`);
+
+            // Check again right before heavy work
+            if (maxItems > 0 && scrapedCount >= maxItems) {
+                log.info(`Max items reached before parsing detail, skipping: ${url}`);
+                return;
+            }
 
             const jsonLd = extractFromJsonLd($);
             const { title: titleParsed, company: companyParsed, location: headingLocation } =
@@ -1018,7 +1073,7 @@ Actor.main(async () => {
             const language = detectLanguage($, url);
 
             const jobIdMatch = url.match(/-(\d+)\.html$/);
-            const jobId = jobIdMatch ? jobIdMatch[1] : null;
+            const jobId = jobIdMatch ? jobId[1] : null;
 
             const result = {
                 url,
@@ -1033,12 +1088,14 @@ Actor.main(async () => {
                 salary,
                 location: locationFinal,
                 language,
-                rawJsonLd: jsonLd?.raw || null,
+                // Store JSON-LD as a STRING to avoid Apify flattening into dozens of columns
+                rawJsonLd: jsonLd?.raw ? JSON.stringify(jsonLd.raw) : null,
                 scrapedAt: new Date().toISOString(),
             };
 
             await Dataset.pushData(result);
-            log.info(`Saved job ${jobId || ''} from ${url}`);
+            scrapedCount += 1;
+            log.info(`Saved job ${jobId || ''} from ${url} (total scraped: ${scrapedCount})`);
         },
 
         failedRequestHandler: async ({ request }) => {
@@ -1050,5 +1107,5 @@ Actor.main(async () => {
 
     log.info('Starting crawler...');
     await crawler.run();
-    log.info('Crawler finished.');
+    log.info(`Crawler finished. Total jobs scraped: ${scrapedCount}`);
 });
