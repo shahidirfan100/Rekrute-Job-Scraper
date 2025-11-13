@@ -299,31 +299,41 @@ function simplifyHtmlContent(html) {
 
 /**
  * Job description extraction (before simplification).
+ * PRIMARY: div#recruiterDescription (correct selector on single job page).
  */
 function getDescriptionHtml($) {
     let html = '';
 
-    const frPoste = $('h2:contains("Poste :"), h2:contains("Poste")')
-        .first()
-        .nextUntil('h2')
-        .html();
-    const frProfil = $('h2:contains("Profil recherché :"), h2:contains("Profil recherché")')
-        .first()
-        .nextUntil('h2')
-        .html();
-    const enPoste = $('h2:contains("Job Description"), h2:contains("Position"), h2:contains("Role")')
-        .first()
-        .nextUntil('h2')
-        .html();
-    const enProfil = $('h2:contains("Profile"), h2:contains("Requirements"), h2:contains("Responsibilities")')
-        .first()
-        .nextUntil('h2')
-        .html();
+    // ✅ First, the correct single-page selector you provided
+    const recruiterDesc = $('#recruiterDescription').first();
+    if (recruiterDesc.length) {
+        html = recruiterDesc.html() || '';
+    }
 
-    if (frPoste) html += frPoste;
-    if (frProfil) html += frProfil;
-    if (enPoste) html += enPoste;
-    if (enProfil) html += enProfil;
+    // If that fails for some reason, fall back to old heuristics
+    if (!html) {
+        const frPoste = $('h2:contains("Poste :"), h2:contains("Poste")')
+            .first()
+            .nextUntil('h2')
+            .html();
+        const frProfil = $('h2:contains("Profil recherché :"), h2:contains("Profil recherché")')
+            .first()
+            .nextUntil('h2')
+            .html();
+        const enPoste = $('h2:contains("Job Description"), h2:contains("Position"), h2:contains("Role")')
+            .first()
+            .nextUntil('h2')
+            .html();
+        const enProfil = $('h2:contains("Profile"), h2:contains("Requirements"), h2:contains("Responsibilities")')
+            .first()
+            .nextUntil('h2')
+            .html();
+
+        if (frPoste) html += frPoste;
+        if (frProfil) html += frProfil;
+        if (enPoste) html += enPoste;
+        if (enProfil) html += enProfil;
+    }
 
     // detail page containers
     if (!html) {
@@ -424,8 +434,78 @@ function getDatePosted($) {
     return null;
 }
 
-function getEmploymentType($, jsonLd, descriptionText) {
+/**
+ * Extract extra meta from the header column:
+ *   .col-md-10.col-sm-12.col-xs-12
+ * We look here for employment type + salary (and optionally location).
+ */
+function extractHeaderInfo($) {
+    const header = $('.col-md-10.col-sm-12.col-xs-12').first();
+    if (!header.length) return {};
+
+    const text = header
+        .text()
+        .replace(/\u00a0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!text) return {};
+
+    let employmentType = null;
+    let salary = null;
+    let location = null;
+
+    // Employment type patterns (French & English)
+    const typePatterns = [
+        /Type\s+de\s+contrat(?:\s+proposé)?\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Type\s+of\s+contract(?:\s+proposed)?\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Contrat\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+    ];
+    for (const re of typePatterns) {
+        const m = text.match(re);
+        if (m && m[1]) {
+            employmentType = m[1].trim();
+            break;
+        }
+    }
+
+    // Salary patterns
+    const salaryPatterns = [
+        /Salaire\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Rémunération\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Salary\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+    ];
+    for (const re of salaryPatterns) {
+        const m = text.match(re);
+        if (m && m[1]) {
+            salary = m[1].trim();
+            break;
+        }
+    }
+
+    // Location (optional, but can help)
+    const locPatterns = [
+        /Lieu\s+de\s+travail\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Localisation\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+        /Location\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
+    ];
+    for (const re of locPatterns) {
+        const m = text.match(re);
+        if (m && m[1]) {
+            location = m[1].trim();
+            break;
+        }
+    }
+
+    return { employmentType, salary, location };
+}
+
+/**
+ * Employment type: prefer JSON-LD, then header info, then text heuristics.
+ */
+function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
     if (jsonLd?.employmentType) return jsonLd.employmentType;
+    if (headerMeta.employmentType) return headerMeta.employmentType;
 
     const text = (descriptionText || $('body').text() || '').toLowerCase();
 
@@ -439,8 +519,12 @@ function getEmploymentType($, jsonLd, descriptionText) {
     return null;
 }
 
-function getSalary($, jsonLd, descriptionText) {
+/**
+ * Salary: prefer JSON-LD, then header info, then body heuristics.
+ */
+function getSalary($, jsonLd, descriptionText, headerMeta = {}) {
     if (jsonLd?.salary) return jsonLd.salary;
+    if (headerMeta.salary) return headerMeta.salary;
 
     const text = (descriptionText || $('body').text() || '');
 
@@ -491,7 +575,6 @@ function detectLanguage($, url) {
 
 /**
  * STRICT job-detail URL recognition + structural selectors.
- * This is where Afrique listing previously got misclassified as a job.
  */
 function findJobLinks($, baseUrl) {
     const links = new Set();
@@ -512,8 +595,7 @@ function findJobLinks($, baseUrl) {
             // Ignore clear listing paths (offres = plural / list)
             if (/\/offres/i.test(path) || /offres\.html$/i.test(path)) return;
 
-            // Require a detail slug with numeric ID at the end, e.g.:
-            // /offre-emploi-some-title-177064.html
+            // Require a detail slug with numeric ID at the end
             if (/\/offre-emploi[^/]*-\d+\.html$/i.test(path) || /\/job-offer[^/]*-\d+\.html$/i.test(path)) {
                 links.add(url.href);
             }
@@ -522,7 +604,7 @@ function findJobLinks($, baseUrl) {
         }
     });
 
-    // 2) Generic fallback over all anchors (extra safety)
+    // 2) Generic fallback over all anchors
     if (links.size === 0) {
         $('a[href]').each((_, el) => {
             const href = $(el).attr('href');
@@ -601,8 +683,9 @@ function buildStartUrl({ keyword, location, category, lang }) {
 /**
  * Fallback for location from header / URL.
  */
-function inferLocationFallback($, url, existingLocation) {
+function inferLocationFallback($, url, existingLocation, headerMeta = {}) {
     if (existingLocation) return existingLocation;
+    if (headerMeta.location) return headerMeta.location;
 
     const headerText =
         $('.page-heading h1').first().text() ||
@@ -875,6 +958,8 @@ async function main() {
                         const pageLang = detectLanguage($page, detailUrl);
 
                         const jsonLd = extractFromJsonLd($page);
+                        const headerMeta = extractHeaderInfo($page);
+
                         const { title: titleHtml, company: companyHtml, location: locationHtml } =
                             parseTitleCompanyLocation($page);
 
@@ -906,10 +991,10 @@ async function main() {
                             jsonLd?.location ||
                             locationHtml ||
                             null;
-                        finalLocation = inferLocationFallback($page, detailUrl, finalLocation);
+                        finalLocation = inferLocationFallback($page, detailUrl, finalLocation, headerMeta);
 
-                        const employmentType = getEmploymentType($page, jsonLd, descriptionText);
-                        const salary = getSalary($page, jsonLd, descriptionText);
+                        const employmentType = getEmploymentType($page, jsonLd, descriptionText, headerMeta);
+                        const salary = getSalary($page, jsonLd, descriptionText, headerMeta);
 
                         const record = {
                             url: detailUrl,
