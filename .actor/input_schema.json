@@ -54,6 +54,13 @@
       "editor": "number",
       "default": 20
     },
+        "dedupe": {
+      "title": "Deduplicate results",
+      "type": "boolean",
+      "description": "Remove duplicate job URLs from results (in-memory deduplication).",
+      "editor": "checkbox",
+      "default": true
+    },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
@@ -63,13 +70,6 @@
         "useApifyProxy": true,
         "apifyProxyGroups": ["RESIDENTIAL"]
       }
-    },
-    "dedupe": {
-      "title": "Deduplicate results",
-      "type": "boolean",
-      "description": "Remove duplicate job URLs from results (in-memory deduplication).",
-      "editor": "checkbox",
-      "default": true
     }
   },
   "required": [],

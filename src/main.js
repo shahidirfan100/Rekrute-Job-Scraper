@@ -158,7 +158,7 @@ function parseTitleCompanyLocation($) {
 }
 
 /**
- * First sanitizer: remove scripts/styles/forms/nav/sidebar/footer etc.
+ * Sanitizer: remove scripts/styles/forms/nav/sidebar/footer etc.
  * Then pick densest block.
  */
 function sanitizeDescriptionHtml(html) {
@@ -255,7 +255,7 @@ function simplifyHtmlContent(html) {
 
     const $ = cheerioLoad(`<div id="root">${html}</div>`);
 
-    // unwrap all disallowed tags (div, section, span, etc.)
+    // unwrap disallowed tags (div, section, span, etc.)
     $('#root *').each((_, el) => {
         const $el = $(el);
         const tag = el.tagName ? el.tagName.toLowerCase() : '';
@@ -298,19 +298,58 @@ function simplifyHtmlContent(html) {
 }
 
 /**
- * Job description extraction (before simplification).
- * PRIMARY: div#recruiterDescription (correct selector on single job page).
+ * Job description extraction.
+ * PRIORITY:
+ *  1) structured description in `.contentbloc > .col-md-12.blc` (h2, p, ul)
+ *  2) #recruiterDescription as a whole
+ *  3) old heuristic fallbacks
  */
 function getDescriptionHtml($) {
     let html = '';
 
-    // ✅ First, the correct single-page selector you provided
-    const recruiterDesc = $('#recruiterDescription').first();
-    if (recruiterDesc.length) {
-        html = recruiterDesc.html() || '';
+    // 1) Preferred: inside recruiterDescription -> .contentbloc > .col-md-12.blc > h2/p/ul
+    let container = $('#recruiterDescription');
+    if (!container.length) {
+        container = $('.contentbloc');
     }
 
-    // If that fails for some reason, fall back to old heuristics
+    if (container.length) {
+        const blocks = container.find('> .col-md-12.blc');
+        if (blocks.length) {
+            const sections = [];
+            blocks.each((_, block) => {
+                const $block = $(block);
+                const parts = [];
+
+                $block.children('h2, p, ul').each((__, child) => {
+                    const $child = $(child);
+                    const tag = child.tagName ? child.tagName.toLowerCase() : '';
+                    if (!tag) return;
+                    const innerHtml = $child.html() || '';
+                    if (!innerHtml.trim()) return;
+                    parts.push(`<${tag}>${innerHtml}</${tag}>`);
+                });
+
+                if (parts.length) {
+                    sections.push(`<div class="job-section">${parts.join('\n')}</div>`);
+                }
+            });
+
+            if (sections.length) {
+                html = sections.join('\n');
+            }
+        }
+    }
+
+    // 2) If nothing from structured blocks, use recruiterDescription raw
+    if (!html) {
+        const recruiterDescRaw = $('#recruiterDescription').first();
+        if (recruiterDescRaw.length) {
+            html = recruiterDescRaw.html() || '';
+        }
+    }
+
+    // 3) Older fallbacks (in case layout differs on some pages)
     if (!html) {
         const frPoste = $('h2:contains("Poste :"), h2:contains("Poste")')
             .first()
@@ -335,7 +374,7 @@ function getDescriptionHtml($) {
         if (enProfil) html += enProfil;
     }
 
-    // detail page containers
+    // 4) generic detail containers
     if (!html) {
         const jobSelectors = [
             '#job_desc',
@@ -362,7 +401,7 @@ function getDescriptionHtml($) {
         }
     }
 
-    // fallback: central column
+    // 5) fallback: central column densest block
     if (!html) {
         const centerSelectors = [
             '.content-column',
@@ -437,7 +476,7 @@ function getDatePosted($) {
 /**
  * Extract extra meta from the header column:
  *   .col-md-10.col-sm-12.col-xs-12
- * We look here for employment type + salary (and optionally location).
+ * (kept for salary / occasional hints)
  */
 function extractHeaderInfo($) {
     const header = $('.col-md-10.col-sm-12.col-xs-12').first();
@@ -483,7 +522,7 @@ function extractHeaderInfo($) {
         }
     }
 
-    // Location (optional, but can help)
+    // Location (optional)
     const locPatterns = [
         /Lieu\s+de\s+travail\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
         /Localisation\s*[:\-]?\s*([^•|\n]+?)(?:\s*(?:\||•|$))/i,
@@ -501,12 +540,39 @@ function extractHeaderInfo($) {
 }
 
 /**
- * Employment type: prefer JSON-LD, then header info, then text heuristics.
+ * Employment type:
+ *  1) JSON-LD
+ *  2) dedicated <li> "Type de contrat ..."/"Type of contract ..."
+ *  3) headerMeta
+ *  4) heuristics in body text
  */
 function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
     if (jsonLd?.employmentType) return jsonLd.employmentType;
+
+    // 2) <li> based extraction (most reliable on Rekrute)
+    const li = $('li:contains("Type de contrat"), li:contains("Type of contract")').first();
+    if (li.length) {
+        const text = li
+            .text()
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (text) {
+            // e.g. "Type of contract proposed : Permanent contract - Télétravail : Hybrid"
+            const m =
+                text.match(/Type\s+de\s+contrat(?:\s+proposé)?\s*[:\-]\s*([^-\|]+)/i) ||
+                text.match(/Type\s+of\s+contract(?:\s+proposed)?\s*[:\-]\s*([^-\|]+)/i);
+            if (m && m[1]) {
+                const parsed = m[1].trim();
+                if (parsed) return parsed;
+            }
+        }
+    }
+
+    // 3) header meta as secondary
     if (headerMeta.employmentType) return headerMeta.employmentType;
 
+    // 4) heuristics from description/body text
     const text = (descriptionText || $('body').text() || '').toLowerCase();
 
     if (/cdi\b/.test(text)) return 'CDI';
@@ -520,11 +586,28 @@ function getEmploymentType($, jsonLd, descriptionText, headerMeta = {}) {
 }
 
 /**
- * Salary: prefer JSON-LD, then header info, then body heuristics.
+ * Salary: prefer JSON-LD, then header info, then <li> with "Salaire"/"Salary",
+ * then body heuristics.
  */
 function getSalary($, jsonLd, descriptionText, headerMeta = {}) {
     if (jsonLd?.salary) return jsonLd.salary;
     if (headerMeta.salary) return headerMeta.salary;
+
+    const li = $('li:contains("Salaire"), li:contains("Rémunération"), li:contains("Salary")').first();
+    if (li.length) {
+        const t = li
+            .text()
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (t) {
+            const m =
+                t.match(/Salaire\s*[:\-]\s*(.*)/i) ||
+                t.match(/Rémunération\s*[:\-]\s*(.*)/i) ||
+                t.match(/Salary\s*[:\-]\s*(.*)/i);
+            if (m && m[1]) return m[1].trim();
+        }
+    }
 
     const text = (descriptionText || $('body').text() || '');
 
