@@ -20,8 +20,11 @@ const headerGenerator = new HeaderGenerator({
     locales: ['fr-FR', 'fr', 'en-US', 'en'],
 });
 
-// Counter to respect max items limit
+// Counter to respect max items limit (only incremented on DETAIL pages)
 let scrapedCount = 0;
+
+// We need a reference to the crawler to be able to abort it when maxItems reached
+let crawler;
 
 function toPositiveInt(value, defaultValue, { min = 1, max = 100000 } = {}) {
     const n = Number(value);
@@ -761,20 +764,6 @@ function findNextPage($, baseUrl) {
             return false; // break
         });
 
-        if (!nextValue && options.length >= 2) {
-            // fallback: figure out current index by "selected" attribute
-            let currentIndex = -1;
-            options.each((i, opt) => {
-                if ($(opt).is('[selected]')) {
-                    currentIndex = i;
-                    return false;
-                }
-            });
-            if (currentIndex > -1 && currentIndex + 1 < options.length) {
-                nextValue = $(options[currentIndex + 1]).attr('value');
-            }
-        }
-
         if (nextValue) {
             nextUrl = toAbs(nextValue, baseUrl);
             if (nextUrl) return nextUrl;
@@ -912,7 +901,7 @@ Actor.main(async () => {
         });
     }
 
-    const crawler = new CheerioCrawler({
+    crawler = new CheerioCrawler({
         requestQueue,
         maxConcurrency: toPositiveInt(maxConcurrency, 20, { min: 1, max: 1000 }),
         maxRequestsPerCrawl: toPositiveInt(maxRequestsPerCrawl, 5000, { min: 1, max: 100000 }),
@@ -947,12 +936,6 @@ Actor.main(async () => {
         requestHandler: async ({ request, $, response, session }) => {
             const url = request.loadedUrl || request.url;
 
-            // If we already reached the limit, skip all further work
-            if (maxItems > 0 && scrapedCount >= maxItems) {
-                log.debug(`Max items reached, skipping request: ${url}`);
-                return;
-            }
-
             if (!$) {
                 throw new Error(`No HTML body loaded for ${url}`);
             }
@@ -971,13 +954,16 @@ Actor.main(async () => {
             const weAreDetail = isDetailUrl(url);
             const isDetail = userLabel === 'DETAIL' || (userLabel === 'AUTO' && weAreDetail);
 
+            // ---------- LISTING PAGE ----------
             if (!isDetail) {
-                // ---------- LISTING PAGE ----------
                 log.info(`Listing page: ${url}`);
 
-                // If limit already hit, do nothing
+                // If limit already hit, skip everything on this listing
                 if (maxItems > 0 && scrapedCount >= maxItems) {
-                    log.info(`Max items reached, not processing listing: ${url}`);
+                    log.info(`Max items reached (${scrapedCount}/${maxItems}), skipping listing: ${url}`);
+                    if (crawler?.autoscaledPool) {
+                        await crawler.autoscaledPool.abort();
+                    }
                     return;
                 }
 
@@ -991,15 +977,8 @@ Actor.main(async () => {
                     log.info(`Found ${jobLinks.length} job links on listing`);
                 }
 
-                // Respect remaining slots for jobs
-                let remaining = Infinity;
-                if (maxItems > 0) {
-                    remaining = Math.max(maxItems - scrapedCount, 0);
-                }
-
-                let addedCount = 0;
+                // We still enqueue, but detail pages themselves will hard-respect maxItems
                 for (const link of jobLinks) {
-                    if (remaining <= 0) break;
                     await requestQueue.addRequest({
                         url: link,
                         userData: {
@@ -1007,15 +986,9 @@ Actor.main(async () => {
                             sourceUrl: baseUrl,
                         },
                     });
-                    remaining -= 1;
-                    addedCount += 1;
                 }
 
-                if (addedCount > 0) {
-                    log.info(`Enqueued ${addedCount} job detail requests from listing ${url}`);
-                }
-
-                // Only follow pagination if we still have capacity
+                // Only follow pagination if we haven't reached the max
                 if (maxItems === 0 || scrapedCount < maxItems) {
                     const nextUrl = findNextPage($, baseUrl);
                     if (nextUrl) {
@@ -1031,6 +1004,9 @@ Actor.main(async () => {
                     }
                 } else {
                     log.info(`Max items reached, pagination not followed from ${url}`);
+                    if (crawler?.autoscaledPool) {
+                        await crawler.autoscaledPool.abort();
+                    }
                 }
 
                 return;
@@ -1039,11 +1015,31 @@ Actor.main(async () => {
             // ---------- DETAIL PAGE ----------
             log.info(`Detail page: ${url}`);
 
-            // Check again right before heavy work
-            if (maxItems > 0 && scrapedCount >= maxItems) {
-                log.info(`Max items reached before parsing detail, skipping: ${url}`);
-                return;
+            // *** Hard limit enforcement with safe increment-first pattern ***
+            if (maxItems > 0) {
+                // Quick short-circuit before doing heavy parsing work
+                if (scrapedCount >= maxItems) {
+                    log.info(`Max items already reached (${scrapedCount}/${maxItems}), skipping detail: ${url}`);
+                    if (crawler?.autoscaledPool) {
+                        await crawler.autoscaledPool.abort();
+                    }
+                    return;
+                }
+
+                // Reserve a slot for this job
+                scrapedCount += 1;
+
+                // If we exceeded (due to race), immediately stop and do not push
+                if (scrapedCount > maxItems) {
+                    log.info(`Over limit after increment (${scrapedCount}/${maxItems}), skipping detail: ${url}`);
+                    if (crawler?.autoscaledPool) {
+                        await crawler.autoscaledPool.abort();
+                    }
+                    return;
+                }
             }
+
+            // ---------- Actual data extraction ----------
 
             const jsonLd = extractFromJsonLd($);
             const { title: titleParsed, company: companyParsed, location: headingLocation } =
@@ -1073,7 +1069,7 @@ Actor.main(async () => {
             const language = detectLanguage($, url);
 
             const jobIdMatch = url.match(/-(\d+)\.html$/);
-            const jobId = jobIdMatch ? jobId[1] : null;
+            const jobId = jobIdMatch ? jobIdMatch[1] : null;
 
             const result = {
                 url,
@@ -1094,8 +1090,13 @@ Actor.main(async () => {
             };
 
             await Dataset.pushData(result);
-            scrapedCount += 1;
             log.info(`Saved job ${jobId || ''} from ${url} (total scraped: ${scrapedCount})`);
+
+            // If we just reached the limit with this job, stop the crawler
+            if (maxItems > 0 && scrapedCount >= maxItems && crawler?.autoscaledPool) {
+                log.info(`Max items (${maxItems}) reached, aborting crawler...`);
+                await crawler.autoscaledPool.abort();
+            }
         },
 
         failedRequestHandler: async ({ request }) => {
