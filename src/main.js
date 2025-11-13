@@ -14,7 +14,6 @@ import { JSDOM } from 'jsdom';
 
 // ---------- Global config & helpers ----------
 
-// Reuse a single header generator for stealthy browser-like headers.
 const headerGenerator = new HeaderGenerator({
     browsers: ['chrome'],
     devices: ['desktop'],
@@ -22,18 +21,12 @@ const headerGenerator = new HeaderGenerator({
     locales: ['fr-FR', 'fr', 'en-US', 'en'],
 });
 
-/**
- * Normalize and clamp numeric input.
- */
 function toPositiveInt(value, defaultValue, { min = 1, max = 100000 } = {}) {
     const n = Number(value);
     if (!Number.isFinite(n)) return defaultValue;
     return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
-/**
- * Return absolute URL given a possibly relative href and base.
- */
 function toAbs(href, base) {
     try {
         return new URL(href, base).href;
@@ -42,21 +35,13 @@ function toAbs(href, base) {
     }
 }
 
-/**
- * Basic "blocked/captcha" heuristic.
- */
 function isBlocked($) {
     const text = $('body').text().toLowerCase();
     return /captcha|access denied|forbidden|blocked|unusual traffic/.test(text);
 }
 
-/**
- * Clean HTML to a normalized text string.
- */
 function cleanText(htmlOrText) {
     if (!htmlOrText) return null;
-
-    // If it's HTML, strip tags via cheerio
     const $ = cheerioLoad(`<div id="root">${htmlOrText}</div>`);
     let text = $('#root').text();
 
@@ -74,8 +59,7 @@ function cleanText(htmlOrText) {
 }
 
 /**
- * Try to extract JobPosting data from JSON-LD.
- * Returns a plain object with a few normalized fields or null.
+ * Try to extract JobPosting from JSON-LD.
  */
 function extractFromJsonLd($) {
     const scripts = $('script[type="application/ld+json"]');
@@ -86,7 +70,6 @@ function extractFromJsonLd($) {
             if (!jsonText.trim()) continue;
 
             const parsed = JSON.parse(jsonText);
-
             const nodes = [];
             const addNode = (node) => {
                 if (!node) return;
@@ -103,32 +86,31 @@ function extractFromJsonLd($) {
             for (const e of nodes) {
                 const t = e['@type'] || e.type;
                 const types = Array.isArray(t) ? t : [t];
+                if (!types.includes('JobPosting')) continue;
 
-                if (types.includes('JobPosting')) {
-                    const jobLoc = e.jobLocation || {};
-                    const addr = jobLoc.address || {};
+                const jobLoc = e.jobLocation || {};
+                const addr = jobLoc.address || {};
 
-                    return {
-                        raw: e,
-                        title: e.title || e.name || null,
-                        company: e.hiringOrganization?.name || null,
-                        datePosted: e.datePosted || null,
-                        descriptionHtml: e.description || null,
-                        employmentType: e.employmentType || null,
-                        validThrough: e.validThrough || null,
-                        location:
-                            addr.addressLocality ||
-                            addr.addressRegion ||
-                            addr.addressCountry ||
-                            null,
-                        salary: e.baseSalary?.value?.value
-                            ? `${e.baseSalary.value.value} ${e.baseSalary.value.currency || ''}`.trim()
-                            : null,
-                    };
-                }
+                return {
+                    raw: e,
+                    title: e.title || e.name || null,
+                    company: e.hiringOrganization?.name || null,
+                    datePosted: e.datePosted || null,
+                    descriptionHtml: e.description || null,
+                    employmentType: e.employmentType || null,
+                    validThrough: e.validThrough || null,
+                    location:
+                        addr.addressLocality ||
+                        addr.addressRegion ||
+                        addr.addressCountry ||
+                        null,
+                    salary: e.baseSalary?.value?.value
+                        ? `${e.baseSalary.value.value} ${e.baseSalary.value.currency || ''}`.trim()
+                        : null,
+                };
             }
         } catch {
-            // ignore JSON errors and continue
+            // continue on JSON errors
         }
     }
 
@@ -136,37 +118,34 @@ function extractFromJsonLd($) {
 }
 
 /**
- * Parse title, company, location from heading + DOM.
- * Multi-language friendly and defensive.
+ * Parse title + company + (maybe) location from headings.
  */
 function parseTitleCompanyLocation($) {
-    // Primary: <h1>Title - Company - Location</h1> (or variations)
     const h1 = $('h1').first().text().trim();
     let title = null;
     let company = null;
     let location = null;
 
     if (h1) {
-        const parts = h1.split(/\s[-–|]\s/); // split on -, – or |
+        const parts = h1.split(/\s[-–|]\s/);
         if (parts.length >= 1) title = parts[0]?.trim() || null;
         if (parts.length >= 2) company = parts[1]?.trim() || null;
         if (parts.length >= 3) location = parts[2]?.trim() || null;
     }
 
-    // Fallback: dedicated company element
     if (!company) {
         const companySel =
             '.company, .company-name, .societe, .society, a.company, a.company-name';
         company = $(companySel).first().text().trim() || null;
     }
 
-    // Microdata / schema.org addressLocality
+    // Microdata location
     if (!location) {
         const microLoc = $('[itemprop="jobLocation"] [itemprop="addressLocality"], [itemprop="addressLocality"]').first().text().trim();
         if (microLoc) location = microLoc;
     }
 
-    // Fallback: location label in FR/EN
+    // FR/EN labels
     if (!location) {
         const locLabel = $('p:contains("Poste basé à"), p:contains("Localisation"), p:contains("Location")')
             .first()
@@ -181,99 +160,201 @@ function parseTitleCompanyLocation($) {
 }
 
 /**
- * Pick main content container by heuristics (for description fallback).
+ * Clean up a description HTML fragment:
+ *  - remove scripts/styles/forms/nav/header/footer
+ *  - drop sidebars, filters, pagination, footer, auth modal, etc.
+ *  - keep the single densest content block as final.
  */
-function findMainContentHtml($) {
-    const selectors = [
-        '#job_desc', '#job', '#job-info', '#jobInfo', '#jobDetail',
-        '.job-description', '.job__description', '.annonce', '.job', '.jobDetail',
-        'article.job', 'article'
-    ];
+function sanitizeDescriptionHtml(html) {
+    if (!html) return null;
 
-    for (const sel of selectors) {
-        const el = $(sel).first();
-        if (el.length) {
-            const textLen = el.text().replace(/\s+/g, ' ').trim().length;
-            if (textLen > 200) {
-                return el.html() || null;
-            }
-        }
+    const $ = cheerioLoad(`<div id="root">${html}</div>`);
+
+    // Remove obvious junk
+    $('#root script, #root style, #root link, #root noscript, #root form').remove();
+    $('#root header, #root nav, #root footer').remove();
+
+    const blacklistSelectors = [
+        '#fortopscroll',
+        '.wrapper',
+        '.preloader',
+        '#sidebar',
+        '#rk-articles',
+        '#rk-filter-panel',
+        '.pagination',
+        '.subbar',
+        '.footer',
+        'footer',
+        '#rk-auth-scope',
+        '.modal',
+        '.navbar-burger',
+    ];
+    for (const sel of blacklistSelectors) {
+        $(sel).remove();
     }
 
-    // Fallback: densest <div>/<section> in the page body
-    let bestHtml = null;
+    // Collapsing obvious layout wrappers if they only wrap a single child
+    let changed = true;
+    while (changed) {
+        changed = false;
+        $('#root > div, #root > section, #root > article').each((_, el) => {
+            const $el = $(el);
+            const children = $el.children('div, section, article');
+            const textLen = $el.text().replace(/\s+/g, ' ').trim().length;
+            if (children.length === 1 && textLen === children.text().replace(/\s+/g, ' ').trim().length) {
+                // promote child
+                $('#root').append(children);
+                $el.remove();
+                changed = true;
+            }
+        });
+    }
+
+    // Find densest content block inside root
+    let best = null;
     let bestLen = 0;
 
-    $('div, section').each((_, el) => {
-        const $el = $(el);
-        // Skip navigation/footer/header-ish elements by class/id
-        const id = ($el.attr('id') || '').toLowerCase();
-        const cls = ($el.attr('class') || '').toLowerCase();
-        if (/header|footer|nav|menu|breadcrumb|sidebar/.test(id + ' ' + cls)) return;
+    $('#root')
+        .find('article, section, div, main')
+        .each((_, el) => {
+            const $el = $(el);
+            const classId = (($el.attr('class') || '') + ' ' + ($el.attr('id') || '')).toLowerCase();
 
-        const textLen = $el.text().replace(/\s+/g, ' ').trim().length;
-        if (textLen > bestLen) {
-            bestLen = textLen;
-            bestHtml = $el.html() || null;
-        }
-    });
+            // Still skip any stray footer/nav/sidebar
+            if (/footer|nav|menu|breadcrumb|sidebar|filter|pagination/.test(classId)) return;
 
-    return bestLen > 100 ? bestHtml : null;
+            const text = $el.text().replace(/\s+/g, ' ').trim();
+            const len = text.length;
+            if (len > bestLen) {
+                bestLen = len;
+                best = el;
+            }
+        });
+
+    let finalHtml;
+    if (best && bestLen > 80) {
+        finalHtml = cheerioLoad('<div></div>')('div').append(cheerioLoad(best).html() || '').html();
+    } else {
+        finalHtml = $('#root').html();
+    }
+
+    finalHtml = (finalHtml || '').trim();
+    return finalHtml || null;
 }
 
 /**
- * Extract description HTML from FR and EN section headings,
- * with a broad fallback to main job description container.
+ * Focused job description extraction:
+ *   - FR sections: Poste, Profil recherché
+ *   - EN sections: Job Description, Profile, Responsibilities
+ *   - fallback: central job detail container, then sanitized.
  */
 function getDescriptionHtml($) {
     let html = '';
 
-    // FR sections
-    const posteFr = $('h2:contains("Poste :"), h2:contains("Poste")').nextUntil('h2').html();
-    const profilFr = $('h2:contains("Profil recherché :"), h2:contains("Profil recherché")').nextUntil('h2').html();
-
-    // EN sections (approximate)
-    const posteEn = $('h2:contains("Job Description"), h2:contains("Position"), h2:contains("Role")')
+    const frPoste = $('h2:contains("Poste :"), h2:contains("Poste")')
+        .first()
         .nextUntil('h2')
         .html();
-    const profilEn = $('h2:contains("Profile"), h2:contains("Requirements"), h2:contains("Candidate profile")')
+    const frProfil = $('h2:contains("Profil recherché :"), h2:contains("Profil recherché")')
+        .first()
+        .nextUntil('h2')
+        .html();
+    const enPoste = $('h2:contains("Job Description"), h2:contains("Position"), h2:contains("Role")')
+        .first()
+        .nextUntil('h2')
+        .html();
+    const enProfil = $('h2:contains("Profile"), h2:contains("Requirements"), h2:contains("Responsibilities")')
+        .first()
         .nextUntil('h2')
         .html();
 
-    if (posteFr) html += posteFr;
-    if (profilFr) html += profilFr;
-    if (posteEn) html += posteEn;
-    if (profilEn) html += profilEn;
+    if (frPoste) html += frPoste;
+    if (frProfil) html += frProfil;
+    if (enPoste) html += enPoste;
+    if (enProfil) html += enProfil;
 
-    // Broad fallback: main job container (guessing common patterns)
+    // Rekrute-style job content containers (detail pages)
     if (!html) {
-        html = findMainContentHtml($) || '';
+        const jobSelectors = [
+            '#job_desc',
+            '#job-detail',
+            '.job-description',
+            '.job-desc',
+            '.job-detail',
+            '.jobdetail',
+            '.job-content',
+            '.job-body',
+            '.jobbody',
+            '.jobdescription',
+        ];
+
+        for (const sel of jobSelectors) {
+            const el = $(sel).first();
+            if (!el.length) continue;
+            const textLen = el.text().replace(/\s+/g, ' ').trim().length;
+            if (textLen > 80) {
+                html = el.html() || '';
+                break;
+            }
+        }
+    }
+
+    // As a last resort, central column (not whole site)
+    if (!html) {
+        const centerSelectors = [
+            '.content-column',
+            '.col-md-9',
+            '#job',
+            '#job-info',
+        ];
+        let root = null;
+        for (const sel of centerSelectors) {
+            const el = $(sel).first();
+            if (el.length) {
+                root = el;
+                break;
+            }
+        }
+        if (root) {
+            let bestHtml = null;
+            let bestLen = 0;
+            root.find('div, section, article').each((_, el) => {
+                const $el = $(el);
+                const classId = (($el.attr('class') || '') + ' ' + ($el.attr('id') || '')).toLowerCase();
+                if (/sidebar|filter|pagination|breadcrumb|footer/.test(classId)) return;
+                const textLen = $el.text().replace(/\s+/g, ' ').trim().length;
+                if (textLen > bestLen) {
+                    bestLen = textLen;
+                    bestHtml = $el.html() || '';
+                }
+            });
+            if (bestHtml && bestLen > 80) html = bestHtml;
+        }
     }
 
     if (!html) return null;
 
-    // Optional: run through jsdom for mild normalization
+    // Normalize a little via jsdom, then aggressively sanitize
     try {
         const dom = new JSDOM(`<div id="root">${html}</div>`);
         const root = dom.window.document.getElementById('root');
-        return root.innerHTML || html;
+        const raw = root.innerHTML || html;
+        return sanitizeDescriptionHtml(raw);
     } catch {
-        return html;
+        return sanitizeDescriptionHtml(html);
     }
 }
 
 /**
- * Extract posted date from textual hints in FR + EN, plus generic date regex.
+ * Extract posted date from page text.
  */
 function getDatePosted($) {
-    // FR: "Publiée le ..."
     const frText = $('p:contains("Publiée"), span:contains("Publiée")').first().text();
     if (frText) {
         const m = frText.match(/Publiée\s+(?:le\s+)?(.*)/i);
         if (m && m[1]) return m[1].trim();
     }
 
-    // EN: "Published on ...", "Posted on ..."
     const enText = $('p:contains("Published"), p:contains("Posted"), span:contains("Published"), span:contains("Posted")')
         .first()
         .text();
@@ -282,7 +363,6 @@ function getDatePosted($) {
         if (m && m[1]) return m[1].trim();
     }
 
-    // Generic date pattern somewhere in body (dd/mm/yyyy or dd-mm-yyyy etc.)
     const bodyText = $('body').text();
     const dateMatch = bodyText.match(/(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/);
     if (dateMatch && dateMatch[1]) {
@@ -292,9 +372,6 @@ function getDatePosted($) {
     return null;
 }
 
-/**
- * Guess employment type from JSON-LD or body text.
- */
 function getEmploymentType($, jsonLd, descriptionText) {
     if (jsonLd?.employmentType) return jsonLd.employmentType;
 
@@ -310,15 +387,11 @@ function getEmploymentType($, jsonLd, descriptionText) {
     return null;
 }
 
-/**
- * Guess salary range from JSON-LD or body text.
- */
 function getSalary($, jsonLd, descriptionText) {
     if (jsonLd?.salary) return jsonLd.salary;
 
     const text = (descriptionText || $('body').text() || '');
 
-    // Common currency markers: MAD, DH, DHS, €, EUR
     const regexes = [
         /(\d[\d\s\.]{2,})\s*(MAD|DH|DHS|€|EUR)/i,
         /(salaire|rémunération)\s*[:\-]?\s*([^\n]+)/i,
@@ -327,7 +400,6 @@ function getSalary($, jsonLd, descriptionText) {
     for (const re of regexes) {
         const m = text.match(re);
         if (m) {
-            // Prefer numeric + currency if present
             if (m[1] && m[2]) return `${m[1].trim()} ${m[2].trim()}`;
             if (m[2]) return m[2].trim();
             if (m[1]) return m[1].trim();
@@ -355,7 +427,6 @@ function detectLanguage($, url) {
     if (/\/en\//i.test(url)) return 'en';
     if (/rekrute\.com\/(fr|offres)/i.test(url)) return 'fr';
 
-    // Fallback: naive word-based detection
     const bodyText = $('body').text().toLowerCase();
     const frHits = (bodyText.match(/\boffre d'emploi|poste|profil recherché|contrat|mission\b/g) || []).length;
     const enHits = (bodyText.match(/\bjob|position|requirements|responsibilities|full-time|part-time\b/g) || []).length;
@@ -367,8 +438,7 @@ function detectLanguage($, url) {
 }
 
 /**
- * Find job detail links on a listing page (FR + EN).
- * Uses domain + path heuristics, then refined regex.
+ * Find job detail links on listing page.
  */
 function findJobLinks($, baseUrl) {
     const links = new Set();
@@ -376,7 +446,6 @@ function findJobLinks($, baseUrl) {
     $('a[href]').each((_, el) => {
         const href = $(el).attr('href');
         if (!href) return;
-
         const abs = toAbs(href, baseUrl);
         if (!abs) return;
 
@@ -387,17 +456,11 @@ function findJobLinks($, baseUrl) {
             return;
         }
 
-        // Host guard: must stay on rekrute.com
         if (!/\.?rekrute\.com$/i.test(url.hostname)) return;
 
         const path = url.pathname || '';
 
-        // Heuristics for job offer URLs:
-        if (
-            /\/offre-emploi/i.test(path) ||
-            /\/job-offer/i.test(path) ||
-            /-emploi-/i.test(path)
-        ) {
+        if (/\/offre-emploi/i.test(path) || /\/job-offer/i.test(path) || /-emploi-/i.test(path)) {
             links.add(url.href);
         }
     });
@@ -407,10 +470,8 @@ function findJobLinks($, baseUrl) {
 
 /**
  * Find next page URL from pagination.
- * Uses rel="next" and FR+EN "Next" labels.
  */
 function findNextPage($, baseUrl) {
-    // 1) rel="next"
     const relNextHref =
         $('.pagination a[rel="next"]').attr('href') ||
         $('a[rel="next"]').attr('href');
@@ -420,7 +481,6 @@ function findNextPage($, baseUrl) {
         if (abs) return abs;
     }
 
-    // 2) Text-based FR + EN
     const nextLink = $('a')
         .filter((_, el) => {
             const txt = $(el).text().trim().toLowerCase();
@@ -437,16 +497,11 @@ function findNextPage($, baseUrl) {
     return null;
 }
 
-/**
- * Build listing URL based on keyword/location/category and language.
- * Uses `clear=1` as requested.
- */
 function buildStartUrl({ keyword, location, category, lang }) {
     let base;
     if (lang === 'en') {
         base = 'https://www.rekrute.com/en/offres.html';
     } else {
-        // default FR
         base = 'https://www.rekrute.com/offres.html';
     }
 
@@ -454,15 +509,59 @@ function buildStartUrl({ keyword, location, category, lang }) {
     u.searchParams.set('clear', '1');
 
     if (keyword) u.searchParams.set('keyword', String(keyword).trim());
-    if (location) u.searchParams.set('location', String(location).trim());
+    if (location) u.searchParams.set('jobLocation', String(location).trim());
     if (category) u.searchParams.set('category', String(category).trim());
 
     return u.href;
 }
 
+/**
+ * Fallback: infer location from header text or URL slug.
+ */
+function inferLocationFallback($, url, existingLocation) {
+    if (existingLocation) return existingLocation;
+
+    // Try header/title text with pipe
+    const headerText =
+        $('.page-heading h1').first().text() ||
+        $('h1').first().text() ||
+        $('title').first().text() ||
+        '';
+
+    if (headerText) {
+        const m = headerText.match(/\|\s*([^|]+?\(Morocco\)|[^|]+?\(Maroc\))/i);
+        if (m && m[1]) return m[1].trim();
+    }
+
+    // Try any job title anchor (like listing teaser format) if present
+    const teaser = $('a.titreJob').first().text();
+    if (teaser) {
+        const m = teaser.match(/\|\s*([^|]+?\(Morocco\)|[^|]+?\(Maroc\))/i);
+        if (m && m[1]) return m[1].trim();
+    }
+
+    // Slug: ...-casablanca-176253.html
+    try {
+        const path = new URL(url).pathname;
+        const slugMatch = path.match(/-([a-zA-ZÀ-ÿ]+)-\d+\.html$/i);
+        if (slugMatch && slugMatch[1]) {
+            const citySlug = slugMatch[1];
+            const city = citySlug
+                .split('-')
+                .map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase())
+                .join('-');
+            return city;
+        }
+    } catch {
+        // ignore
+    }
+
+    return existingLocation || null;
+}
+
 // ---------- Main actor ----------
 
-await Actor.init(); // for environments that don't use Actor.main
+await Actor.init();
 
 async function main() {
     try {
@@ -479,7 +578,7 @@ async function main() {
             url,
             proxyConfiguration,
             lang = 'fr', // 'fr' | 'en' | 'both'
-            maxConcurrency: MAX_CONCURRENCY_RAW = 20, // << configurable concurrency
+            maxConcurrency: MAX_CONCURRENCY_RAW = 20,
         } = input;
 
         const RESULTS_WANTED = toPositiveInt(RESULTS_WANTED_RAW, 100, { min: 1, max: 10000 });
@@ -497,9 +596,7 @@ async function main() {
             MAX_CONCURRENCY,
         });
 
-        // Build initial URLs
         const initial = [];
-
         if (Array.isArray(startUrls) && startUrls.length) {
             for (const u of startUrls) {
                 if (u) initial.push(String(u));
@@ -517,7 +614,7 @@ async function main() {
             }
         }
 
-        log.info(`Initial start URLs:`, initial);
+        log.info('Initial start URLs:', initial);
 
         const proxyConf = proxyConfiguration
             ? await Actor.createProxyConfiguration(proxyConfiguration)
@@ -525,7 +622,6 @@ async function main() {
 
         const requestQueue = await RequestQueue.open();
 
-        // Seed queue
         for (const start of initial) {
             await requestQueue.addRequest({
                 url: start,
@@ -536,7 +632,6 @@ async function main() {
             });
         }
 
-        // Global state across handlers
         const visitedListUrls = new Set();
         const seenJobUrls = new Set();
 
@@ -555,15 +650,12 @@ async function main() {
             useSessionPool: true,
             sessionPoolOptions: {
                 maxPoolSize: Math.max(50, MAX_CONCURRENCY * 2),
-                sessionOptions: {
-                    maxUsageCount: 50,
-                },
+                sessionOptions: { maxUsageCount: 50 },
             },
             preNavigationHooks: [
                 async (crawlingContext) => {
                     const { request, session } = crawlingContext;
 
-                    // Generate browser-like headers
                     const generated = headerGenerator.getHeaders({
                         httpVersion: '2',
                     });
@@ -573,7 +665,6 @@ async function main() {
                         ...request.headers,
                     };
 
-                    // Light randomized delay to look more human
                     await sleep(500 + Math.random() * 1500);
 
                     log.debug('Requesting URL', {
@@ -587,18 +678,10 @@ async function main() {
                 if (session) session.retire();
             },
             requestHandler: async (ctx) => {
-                const {
-                    request,
-                    $,
-                    body,
-                    contentType,
-                    session,
-                } = ctx;
-
+                const { request, $, body, session } = ctx;
                 const label = request.userData.label || 'LIST';
                 const pageNo = request.userData.pageNo || 1;
 
-                // Ensure we have a cheerio instance
                 let $page = $;
                 if (!$page) {
                     const html = typeof body === 'string' ? body : body?.toString('utf8');
@@ -609,7 +692,6 @@ async function main() {
                     $page = cheerioLoad(html);
                 }
 
-                // Detect block / captcha
                 if (isBlocked($page)) {
                     log.warning(`Potentially blocked page at ${request.url}`);
                     if (session) session.retire();
@@ -626,18 +708,14 @@ async function main() {
                     }
                     visitedListUrls.add(listUrl);
 
-                    const anchorCount = $page('a[href]').length;
-                    log.info(`LIST page ${pageNo} (${listUrl}) has ${anchorCount} links.`);
-
                     const remaining = RESULTS_WANTED - saved - queuedDetail;
                     if (remaining <= 0) {
-                        log.info(`Already queued/saved ${RESULTS_WANTED} jobs, skipping new links on LIST.`);
+                        log.info(`Reached RESULTS_WANTED, skipping new links on LIST.`);
                         return;
                     }
 
-                    // Find job links
                     const jobLinks = findJobLinks($page, listUrl);
-                    log.info(`Found ${jobLinks.length} job links on LIST page ${pageNo}.`);
+                    log.info(`LIST page ${pageNo} (${listUrl}) job links found: ${jobLinks.length}`);
 
                     if (!jobLinks.length) {
                         const snippet = $page('body').text().trim().slice(0, 200);
@@ -663,10 +741,9 @@ async function main() {
                             queuedDetail++;
                         }
                         log.info(
-                            `Queued ${allowed.length} new DETAIL requests (queuedDetail=${queuedDetail}, saved=${saved}).`
+                            `Queued ${allowed.length} DETAIL requests (queuedDetail=${queuedDetail}, saved=${saved}).`
                         );
                     } else {
-                        // URL-only mode: store URLs directly from list pages
                         const allowed = newJobLinks.slice(0, remaining);
                         for (const jobUrl of allowed) {
                             await Dataset.pushData({
@@ -678,46 +755,30 @@ async function main() {
                             });
                             saved++;
                         }
-
-                        log.info(
-                            `Saved ${allowed.length} URL-only items (saved=${saved}/${RESULTS_WANTED}).`
-                        );
+                        log.info(`Saved ${allowed.length} URL-only items (saved=${saved}/${RESULTS_WANTED}).`);
                     }
 
-                    // Pagination
                     if (pageNo < MAX_PAGES && saved < RESULTS_WANTED) {
                         const nextPageUrl = findNextPage($page, listUrl);
-
                         if (nextPageUrl && !visitedListUrls.has(nextPageUrl)) {
                             log.info(`Enqueuing next LIST page: ${nextPageUrl}`);
                             await requestQueue.addRequest({
                                 url: nextPageUrl,
-                                userData: {
-                                    label: 'LIST',
-                                    pageNo: pageNo + 1,
-                                },
+                                userData: { label: 'LIST', pageNo: pageNo + 1 },
                             });
                         } else if (nextPageUrl) {
-                            log.debug(
-                                `Next LIST page already visited or queued: ${nextPageUrl}`
-                            );
+                            log.debug(`Next LIST page already seen/queued: ${nextPageUrl}`);
                         } else {
-                            log.info(
-                                `No next LIST page found from ${listUrl} (pageNo=${pageNo})`
-                            );
+                            log.info(`No next LIST page found from ${listUrl}`);
                         }
                     } else if (pageNo >= MAX_PAGES) {
-                        log.info(
-                            `Reached MAX_PAGES=${MAX_PAGES}, not following pagination from ${listUrl}.`
-                        );
+                        log.info(`Reached MAX_PAGES=${MAX_PAGES}, stopping pagination.`);
                     }
                 } else if (label === 'DETAIL') {
                     detailPages++;
 
                     if (!collectDetails) {
-                        log.debug(
-                            `DETAIL reached but collectDetails=false, skipping: ${request.url}`
-                        );
+                        log.debug(`DETAIL reached but collectDetails=false, skipping: ${request.url}`);
                         return;
                     }
 
@@ -736,21 +797,32 @@ async function main() {
                         const jsonLd = extractFromJsonLd($page);
                         const { title: titleHtml, company: companyHtml, location: locationHtml } =
                             parseTitleCompanyLocation($page);
-                        const descriptionHtml = getDescriptionHtml($page);
 
-                        // Prefer JSON-LD description, then HTML container description
-                        const descriptionText =
-                            cleanText(jsonLd?.descriptionHtml) ||
-                            cleanText(descriptionHtml);
+                        const descriptionHtmlDom = getDescriptionHtml($page);
+                        // Prefer JSON-LD description, but sanitize both
+                        const candidateHtml =
+                            jsonLd?.descriptionHtml ||
+                            jsonLd?.raw?.description ||
+                            descriptionHtmlDom ||
+                            null;
 
-                        // Date posted: JSON-LD, then DOM/text heuristics
+                        const descriptionHtml = candidateHtml
+                            ? sanitizeDescriptionHtml(candidateHtml)
+                            : null;
+                        const descriptionText = cleanText(descriptionHtml);
+
                         const datePostedLd = jsonLd?.datePosted || null;
                         const datePostedText = getDatePosted($page);
                         const datePosted = datePostedLd || datePostedText || null;
 
                         const finalTitle = jsonLd?.title || titleHtml || null;
                         const finalCompany = jsonLd?.company || companyHtml || null;
-                        const finalLocation = jsonLd?.location || locationHtml || null;
+
+                        let finalLocation =
+                            jsonLd?.location ||
+                            locationHtml ||
+                            null;
+                        finalLocation = inferLocationFallback($page, detailUrl, finalLocation);
 
                         const employmentType = getEmploymentType($page, jsonLd, descriptionText);
                         const salary = getSalary($page, jsonLd, descriptionText);
@@ -759,12 +831,12 @@ async function main() {
                             url: detailUrl,
                             title: finalTitle,
                             company: finalCompany,
-                            location: finalLocation,
+                            location: finalLocation || null,
                             datePosted,
                             employmentType: employmentType || null,
                             validThrough: jsonLd?.validThrough || null,
                             salary: salary || null,
-                            descriptionHtml: jsonLd?.descriptionHtml || descriptionHtml || null,
+                            descriptionHtml: descriptionHtml || null,
                             descriptionText: descriptionText || null,
                             language: pageLang || null,
                             source: 'rekrute.com',
@@ -774,19 +846,13 @@ async function main() {
                         await Dataset.pushData(record);
                         saved++;
 
-                        log.info(
-                            `Saved DETAIL ${saved}/${RESULTS_WANTED}: ${detailUrl}`
-                        );
+                        log.info(`Saved DETAIL ${saved}/${RESULTS_WANTED}: ${detailUrl}`);
                     } catch (err) {
-                        log.error(
-                            `Failed to process DETAIL ${request.url}: ${err.message}`
-                        );
+                        log.error(`Failed to process DETAIL ${request.url}: ${err.message}`);
                         if (session) session.retire();
                     }
                 } else {
-                    log.warning(
-                        `Unknown label "${label}" for URL ${request.url}, skipping.`
-                    );
+                    log.warning(`Unknown label "${label}" for URL ${request.url}, skipping.`);
                 }
             },
         });
@@ -806,7 +872,6 @@ async function main() {
 }
 
 main().catch((err) => {
-    // eslint-disable-next-line no-console
     console.error(err);
     process.exit(1);
 });
