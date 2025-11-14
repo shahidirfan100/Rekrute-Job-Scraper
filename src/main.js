@@ -23,6 +23,9 @@ const headerGenerator = new HeaderGenerator({
 // Counter to respect max items limit (only incremented on DETAIL pages)
 let scrapedCount = 0;
 
+// Counter for pagination pages visited
+let pagesVisited = 0;
+
 // We need a reference to the crawler to be able to abort it when maxItems reached
 let crawler;
 
@@ -847,8 +850,9 @@ Actor.main(async () => {
         maxRequestsPerCrawl = 5000,
     } = input;
 
-    // Respect "max jobs" from various possible input fields
+    // Respect "max jobs" from various possible input fields - prioritize results_wanted
     const rawLimit =
+        input.results_wanted ??
         input.maxItems ??
         input.maxJobs ??
         input.maxResults ??
@@ -861,7 +865,16 @@ Actor.main(async () => {
         log.info('No max items limit set (will crawl all available jobs within other limits).');
     }
 
+    // Respect max_pages limit
+    const maxPages = toPositiveInt(input.max_pages, 0, { min: 0, max: 1000 }); // 0 = unlimited
+    if (maxPages > 0) {
+        log.info(`Max pages limit: ${maxPages}`);
+    } else {
+        log.info('No max pages limit set.');
+    }
+
     scrapedCount = 0;
+    pagesVisited = 0;
 
     const requestQueue = await RequestQueue.open();
 
@@ -958,6 +971,19 @@ Actor.main(async () => {
             if (!isDetail) {
                 log.info(`Listing page: ${url}`);
 
+                // Increment pages visited counter
+                pagesVisited += 1;
+                log.info(`Pages visited: ${pagesVisited}${maxPages > 0 ? `/${maxPages}` : ''}`);
+
+                // Check if max pages limit reached
+                if (maxPages > 0 && pagesVisited > maxPages) {
+                    log.info(`Max pages limit reached (${pagesVisited}/${maxPages}), stopping pagination.`);
+                    if (crawler?.autoscaledPool) {
+                        await crawler.autoscaledPool.abort();
+                    }
+                    return;
+                }
+
                 // If limit already hit, skip everything on this listing
                 if (maxItems > 0 && scrapedCount >= maxItems) {
                     log.info(`Max items reached (${scrapedCount}/${maxItems}), skipping listing: ${url}`);
@@ -988,8 +1014,11 @@ Actor.main(async () => {
                     });
                 }
 
-                // Only follow pagination if we haven't reached the max
-                if (maxItems === 0 || scrapedCount < maxItems) {
+                // Only follow pagination if we haven't reached the max items or pages
+                const shouldPaginate = (maxItems === 0 || scrapedCount < maxItems) && 
+                                      (maxPages === 0 || pagesVisited < maxPages);
+                
+                if (shouldPaginate) {
                     const nextUrl = findNextPage($, baseUrl);
                     if (nextUrl) {
                         log.info(`Enqueueing next listing page: ${nextUrl}`);
@@ -1003,7 +1032,12 @@ Actor.main(async () => {
                         log.info(`No next page found from ${url}`);
                     }
                 } else {
-                    log.info(`Max items reached, pagination not followed from ${url}`);
+                    if (maxItems > 0 && scrapedCount >= maxItems) {
+                        log.info(`Max items reached (${scrapedCount}/${maxItems}), pagination stopped.`);
+                    }
+                    if (maxPages > 0 && pagesVisited >= maxPages) {
+                        log.info(`Max pages reached (${pagesVisited}/${maxPages}), pagination stopped.`);
+                    }
                     if (crawler?.autoscaledPool) {
                         await crawler.autoscaledPool.abort();
                     }
